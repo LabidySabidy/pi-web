@@ -4,10 +4,10 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { encodeWav, resampleTo16k } from "@/lib/audio";
 
 const TARGET_RATE = 16000;
-const ROLLING_SECONDS = 2;
-const KWS_POLL_MS = 1000;
-// Drop the trailing rolling window (guaranteed to contain the spoken "finalize").
-const TRAILING_TRIM_SAMPLES = TARGET_RATE * ROLLING_SECONDS;
+const ROLLING_SECONDS = 1.2;
+const KWS_POLL_MS = 400;
+// Best-effort trailing trim; the keyword text strip is the reliable layer.
+const TRAILING_TRIM_SAMPLES = Math.round(TARGET_RATE * 1.5);
 const STORAGE_KEY = "pi-voice-input-enabled";
 
 export type VoiceInputPhase = "idle" | "armed" | "recording" | "transcribing";
@@ -66,6 +66,7 @@ export function useVoiceInput(onSend: (text: string) => void) {
   const sampleRateRef = useRef<number>(TARGET_RATE);
   const rollingRef = useRef<Float32Array[]>([]);
   const recordingRef = useRef<Float32Array[]>([]);
+  const kwsInFlightRef = useRef(false);
 
   const setEnabled = useCallback((next: boolean) => {
     setEnabledState(next);
@@ -116,10 +117,12 @@ export function useVoiceInput(onSend: (text: string) => void) {
   }, [onSend]);
 
   const pollKws = useCallback(async () => {
+    if (kwsInFlightRef.current) return; // don't pile up if a poll is still running
     const rolling = rollingRef.current;
     if (rolling.length === 0) return;
     const b64 = toBase64Pcm16k(rolling, sampleRateRef.current);
     if (!b64) return;
+    kwsInFlightRef.current = true;
     try {
       const res = await fetch("/api/kws", {
         method: "POST",
@@ -141,6 +144,8 @@ export function useVoiceInput(onSend: (text: string) => void) {
       }
     } catch {
       // ignore transient KWS errors
+    } finally {
+      kwsInFlightRef.current = false;
     }
   }, [finalize]);
 
