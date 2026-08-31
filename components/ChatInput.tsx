@@ -30,6 +30,7 @@ import { ModelSelector, type ModelSelectorOption } from "./ModelSelector";
 import { DictationButton } from "./DictationButton";
 import { DictationLevelMeter, DictationProcessing } from "./DictationLevel";
 import { useDictation } from "@/hooks/useDictation";
+import { useVoiceInput } from "@/hooks/useVoiceInput";
 
 export { filterModelOptions } from "./ModelSelector";
 
@@ -536,6 +537,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
   const dictation = useDictation(insertText);
   const dictationRecording = dictation.phase === "recording";
   const dictationTranscribing = dictation.phase === "transcribing";
+  const voiceInput = useVoiceInput(onSend);
 
   useImperativeHandle(ref, () => ({
     insertIfEmpty(text: string) {
@@ -2507,6 +2509,34 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
                 </svg>
               </button>
             )}
+
+            <button
+              type="button"
+              onClick={() => voiceInput.setEnabled(!voiceInput.enabled)}
+              title={voiceInput.enabled ? t("chat.disableVoiceInput") : t("chat.enableVoiceInput")}
+              aria-label={voiceInput.enabled ? t("chat.disableVoiceInput") : t("chat.enableVoiceInput")}
+              style={{
+                display: "flex", alignItems: "center", justifyContent: "center",
+                width: 32, height: 32, padding: 0,
+                background: "none", border: "none", borderRadius: 9,
+                color: voiceInput.enabled
+                  ? (voiceInput.phase === "recording" ? "#e01a4f" : "var(--accent)")
+                  : "var(--text-dim)",
+                cursor: "pointer",
+                opacity: voiceInput.enabled ? 1 : 0.55,
+                transition: "background 0.12s, color 0.12s, opacity 0.12s",
+              }}
+              onMouseEnter={(e) => { e.currentTarget.style.background = "var(--bg-hover)"; }}
+              onMouseLeave={(e) => { e.currentTarget.style.background = "none"; }}
+            >
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <circle cx="12" cy="12" r="2" />
+                <path d="M16.24 7.76a6 6 0 0 1 0 8.49" />
+                <path d="M19.07 4.93a10 10 0 0 1 0 14.14" />
+                <path d="M7.76 16.24a6 6 0 0 1 0-8.49" />
+                <path d="M4.93 19.07a10 10 0 0 1 0-14.14" />
+              </svg>
+            </button>
 
             <DictationButton dictation={dictation} />
 

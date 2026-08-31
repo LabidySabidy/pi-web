@@ -61,7 +61,7 @@ function main() {
   const voices = requested.length > 0 ? requested : DEFAULT_VOICES;
 
   ensureVenv();
-  run(venvPython, ["-m", "pip", "install", "piper-tts", "flask"]);
+  run(venvPython, ["-m", "pip", "install", "piper-tts", "flask", "pocketsphinx"]);
   run(venvPython, ["-m", "piper.download_voices", ...voices, "--download-dir", VOICES_DIR]);
   log("done — voices installed under", VOICES_DIR);
 }
