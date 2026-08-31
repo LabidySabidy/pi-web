@@ -6,8 +6,8 @@ import { encodeWav, resampleTo16k } from "@/lib/audio";
 const TARGET_RATE = 16000;
 const ROLLING_SECONDS = 2;
 const KWS_POLL_MS = 1000;
-// Drop trailing audio (the spoken "finalize") before transcribing.
-const TRAILING_TRIM_SAMPLES = Math.round(TARGET_RATE * 1.2);
+// Drop the trailing rolling window (guaranteed to contain the spoken "finalize").
+const TRAILING_TRIM_SAMPLES = TARGET_RATE * ROLLING_SECONDS;
 const STORAGE_KEY = "pi-voice-input-enabled";
 
 export type VoiceInputPhase = "idle" | "armed" | "recording" | "transcribing";
@@ -39,6 +39,14 @@ function toBase64Pcm16k(chunks: Float32Array[], fromRate: number): string {
     binary += String.fromCharCode(...bytes.subarray(i, i + step));
   }
   return btoa(binary);
+}
+
+/** Strip the wake/end keywords from a transcription (safety net for leaks). */
+function stripKeyword(text: string): string {
+  return text
+    .replace(/^(?:hey\s+)?jarvis[,!.\s]*/i, "")
+    .replace(/\s*\b(?:finali[sz]e(?:d|ing)?|finalise(?:d|ing)?)\b\s*[.!?]*$/i, "")
+    .trim();
 }
 
 /**
@@ -95,7 +103,7 @@ export function useVoiceInput(onSend: (text: string) => void) {
         return res.json() as Promise<{ text?: string }>;
       })
       .then((data) => {
-        const text = (data.text ?? "").trim();
+        const text = stripKeyword(data.text ?? "");
         if (text) onSend(text);
         phaseRef.current = "armed";
         setPhase("armed");
