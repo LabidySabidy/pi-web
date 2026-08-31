@@ -315,6 +315,13 @@ export function ChatWindow({ session, sessionRunning, newSessionCwd, newSessionD
   });
   const sessionBusy = agentRunning || bashRunning;
 
+  // Track user-initiated aborts so auto read-aloud doesn't speak a stopped turn.
+  const readAloudAbortedRef = useRef(false);
+  const handleAbortForReadAloud = useCallback(async () => {
+    readAloudAbortedRef.current = true;
+    await handleAbort();
+  }, [handleAbort]);
+
   // Auto read-aloud: speak the latest assistant message when a prompt completes.
   const readAloudEnabled = readAloud.enabled;
   const readAloudSpeak = readAloud.speak;
@@ -322,10 +329,20 @@ export function ChatWindow({ session, sessionRunning, newSessionCwd, newSessionD
   useEffect(() => {
     const wasRunning = prevAgentRunningRef.current;
     prevAgentRunningRef.current = agentRunning;
-    if (!wasRunning || agentRunning) return;
-    if (!completionNotificationsEnabled || !readAloudEnabled) return;
-    const latest = [...messages].reverse().find((m) => m.role === "assistant" && getAssistantProseText(m));
-    if (latest) void readAloudSpeak(getAssistantProseText(latest));
+    if (wasRunning && !agentRunning) {
+      // Run finished. Don't auto-read a turn the user aborted.
+      const aborted = readAloudAbortedRef.current;
+      readAloudAbortedRef.current = false;
+      if (aborted) return;
+      if (!completionNotificationsEnabled || !readAloudEnabled) return;
+      const latest = [...messages].reverse().find((m) => m.role === "assistant" && getAssistantProseText(m));
+      if (latest) void readAloudSpeak(getAssistantProseText(latest));
+      return;
+    }
+    if (!wasRunning && agentRunning) {
+      // New run starts; clear any stale abort flag.
+      readAloudAbortedRef.current = false;
+    }
   }, [agentRunning, messages, completionNotificationsEnabled, readAloudEnabled, readAloudSpeak]);
 
   useEffect(() => {
@@ -340,8 +357,8 @@ export function ChatWindow({ session, sessionRunning, newSessionCwd, newSessionD
 
   // Register the abort handler for the global Esc shortcut
   useEffect(() => {
-    registerAbortHandler(sessionBusy ? handleAbort : null);
-  }, [sessionBusy, handleAbort]);
+    registerAbortHandler(sessionBusy ? handleAbortForReadAloud : null);
+  }, [sessionBusy, handleAbortForReadAloud]);
 
   // --- Lazy-load historical messages ---
   // Only render the last N messages initially. When the user scrolls to the
@@ -585,7 +602,7 @@ export function ChatWindow({ session, sessionRunning, newSessionCwd, newSessionD
     <ChatInput
       ref={chatInputRef}
       onSend={handleSend}
-      onAbort={handleAbort}
+      onAbort={handleAbortForReadAloud}
       onSteer={agentRunning ? handleSteer : undefined}
       onFollowUp={agentRunning ? handleFollowUp : undefined}
       onPromptWithStreamingBehavior={agentRunning ? handlePromptWithStreamingBehavior : undefined}
