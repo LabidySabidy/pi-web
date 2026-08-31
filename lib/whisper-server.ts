@@ -56,18 +56,32 @@ const INFERENCE_PATH = "/inference";
 const POLL_INTERVAL_MS = 500;
 const SERVE_TIMEOUT_MS = 60_000;
 
-/** Resolve the whisper-server exe + model dir from env, defaulting to a sibling Whisper-VTT checkout. */
+/**
+ * Resolve the whisper-server binary + model dir. Priority: explicit env
+ * overrides, then the repo-local `whisper/` dir (populated by
+ * `scripts/setup-whisper.mjs`), then a `WHISPER_VTT_ROOT` override.
+ */
 export function resolveWhisperConfig(
   env: NodeJS.ProcessEnv = process.env,
   baseDir: string = process.cwd(),
+  platform: string = process.platform,
 ): WhisperConfig {
-  const rootDir = env.WHISPER_VTT_ROOT || join(dirname(baseDir), "Whisper-VTT");
-  const serverPath = env.WHISPER_SERVER_PATH || join(rootDir, "whisper-cli", "Release", "whisper-server.exe");
-  const modelDir = env.WHISPER_MODEL_DIR || join(rootDir, "models");
+  const isWin = platform === "win32";
+  const repoDir = join(baseDir, "whisper");
+  const explicitRoot = env.WHISPER_VTT_ROOT;
+
+  const serverPath =
+    env.WHISPER_SERVER_PATH ||
+    (explicitRoot
+      ? join(explicitRoot, "whisper-cli", "Release", "whisper-server.exe")
+      : join(repoDir, "bin", isWin ? "whisper-server.exe" : "whisper-server"));
+  const modelDir =
+    env.WHISPER_MODEL_DIR || (explicitRoot ? join(explicitRoot, "models") : join(repoDir, "models"));
+
   const host = env.WHISPER_HOST || DEFAULT_HOST;
   const portRaw = Number.parseInt(env.WHISPER_PORT ?? "", 10);
   const port = Number.isInteger(portRaw) && portRaw > 0 && portRaw < 65536 ? portRaw : DEFAULT_PORT;
-  return { rootDir, serverPath, modelDir, host, port, defaultModel: DEFAULT_MODEL };
+  return { rootDir: explicitRoot || repoDir, serverPath, modelDir, host, port, defaultModel: DEFAULT_MODEL };
 }
 
 /** List loadable whisper.cpp models (ggml `*.bin` / `*.gguf`) in a directory. */

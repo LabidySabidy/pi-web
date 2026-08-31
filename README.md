@@ -14,6 +14,7 @@ Local browser UI for the [pi coding agent](https://github.com/earendil-works/pi)
 - **Git worktrees**: switch checkouts from the sidebar while keeping sessions from the same repository grouped together.
 - **Web-based configuration**: manage provider login and API keys, models, model tests, plugin packages, and skills without leaving Pi Web.
 - **English, Simplified Chinese, and Traditional Chinese UI**: Pi Web follows the browser language initially and provides a language switcher in the top bar.
+- **Offline voice dictation**: transcribe speech locally with whisper.cpp — see [Dictation](#dictation).
 
 ## Quick Start
 
@@ -88,6 +89,56 @@ $env:HTTPS_PROXY = "http://127.0.0.1:7890"
 $env:NO_PROXY = "localhost,127.0.0.1"
 npx @agegr/pi-web@latest
 ```
+
+## Dictation
+
+Pi Web can transcribe your voice entirely on-device with [whisper.cpp](https://github.com/ggml-org/whisper.cpp): click the microphone in the chat input, speak, click again to stop, and the text is inserted at the cursor. No audio leaves the machine. When the engine or a model is missing, Pi Web reports the service unavailable and hides the microphone.
+
+Dictation runs from this repository's source. Install the local engine and a model once with:
+
+```bash
+npm run setup:whisper            # default base.en model (~140 MB)
+npm run setup:whisper tiny.en    # smaller and faster (~77 MB)
+npm run setup:whisper small.en   # more accurate (~466 MB)
+```
+
+Installed models are switchable from the selector next to the microphone.
+
+### macOS — first run
+
+1. Install the build tools once: `xcode-select --install`, then `brew install cmake`.
+2. Clone this repository, run `npm install`, then `npm run setup:whisper`. On macOS this builds `whisper-server` from source and downloads the model.
+3. Start Pi Web on localhost with `npm run dev` and allow microphone access when prompted.
+
+Keep Pi Web on `http://127.0.0.1:30141` (a secure context) — Safari and Chrome refuse microphone access over a plain LAN address such as `http://192.168.x.x`. For LAN use, front it with HTTPS.
+
+### Windows
+
+The `whisper-server` binaries ship with this repository, so setup only downloads the model:
+
+```bash
+npm run setup:whisper
+```
+
+The bundled binaries need the Microsoft Visual C++ Redistributable, already present on most machines.
+
+### Linux
+
+Same as macOS, using your package manager for the toolchain:
+
+```bash
+sudo apt install cmake build-essential   # or the equivalent for your distro
+npm run setup:whisper
+```
+
+### Engine resolution
+
+Engine and model locations resolve in this order, defaulting to the repo-local `whisper/` directory:
+
+- `WHISPER_SERVER_PATH` — path to the `whisper-server` binary
+- `WHISPER_MODEL_DIR` — directory containing `ggml-*.bin` / `*.gguf` models
+- `WHISPER_VTT_ROOT` — legacy single-root override (`whisper-cli/Release/whisper-server.exe` + `models/`)
+- `WHISPER_HOST` / `WHISPER_PORT` — bind address and port (default `127.0.0.1:8765`)
 
 ## Notes
 

@@ -47,3 +47,13 @@ e2e_*.mjs
 /PLAN.md
 /TASKS.md
 /PROGRESS.md
+
+# whisper dictation engine: committed Windows binaries, downloaded models, build cache
+/whisper/bin/*
+!/whisper/bin/whisper-server.exe
+!/whisper/bin/whisper.dll
+!/whisper/bin/ggml.dll
+!/whisper/bin/ggml-base.dll
+!/whisper/bin/ggml-cpu.dll
+/whisper/models/
+/whisper/build/
