@@ -1,7 +1,7 @@
 "use client";
 import { registerAbortHandler } from "@/hooks/useKeyboardShortcuts";
 import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import type { AgentMessage, AssistantContentBlock, AssistantMessage, BashExecutionMessage, BlockingExtensionUiRequest, CustomMessage, ExtensionUiRequest, SessionInfo, SessionTreeNode, ToolResultMessage, UserMessage } from "@/lib/types";
+import type { AgentMessage, AssistantContentBlock, AssistantMessage, BashExecutionMessage, BlockingExtensionUiRequest, CustomMessage, ExtensionUiRequest, SessionInfo, SessionTreeNode, TextContent, ToolResultMessage, UserMessage } from "@/lib/types";
 import { normalizeCustomPanelLines, parseAnsiLine } from "@/lib/ansi";
 import { asBracketedPaste, toTerminalKeyData } from "@/lib/terminal-input";
 import { countToolCallBlocks, getAssistantErrorMessage, getDisplayableAssistantBlocks, splitFinalAssistantBlocks } from "@/lib/message-display";
@@ -15,6 +15,7 @@ import { useI18n } from "@/hooks/useI18n";
 import { useAgentSession, type AgentPhase, type NoticeItem } from "@/hooks/useAgentSession";
 import { useDragDrop } from "@/hooks/useDragDrop";
 import { useIsMobile } from "@/hooks/useIsMobile";
+import { useReadAloud } from "@/hooks/useReadAloud";
 import type { SessionStatsInfo } from "@/lib/pi-types";
 import type { AppUpdateResponse } from "@/lib/api-types";
 import type { ToolEntry } from "@/lib/tool-presets";
@@ -25,6 +26,16 @@ import {
   restoreScrollTop,
   VISIBLE_PAGE_SIZE,
 } from "@/lib/chat-lazy-load";
+
+function getAssistantProseText(message: AgentMessage): string {
+  if (message.role !== "assistant") return "";
+  const content = (message as AssistantMessage).content ?? [];
+  return content
+    .filter((b): b is TextContent => b.type === "text")
+    .map((b) => b.text)
+    .join("\n")
+    .trim();
+}
 
 interface Props {
   session: SessionInfo | null;
@@ -257,6 +268,7 @@ export function ChatWindow({ session, sessionRunning, newSessionCwd, newSessionD
   const { t } = useI18n();
   const isMobile = useIsMobile();
   const completionNotificationsEnabled = session?.relation?.kind !== "subagent";
+  const readAloud = useReadAloud();
 
   // Wrap onAgentEnd to play the completion sound. This is more reliable than
   // wrapping handleAgentEventRef because useAgentSession overwrites that ref
@@ -302,6 +314,19 @@ export function ChatWindow({ session, sessionRunning, newSessionCwd, newSessionD
     modelsRefreshKey, chatInputRef, onBranchDataChange, onSystemPromptChange, onSystemToolsChange, onSystemInfoLoaderChange, onSessionStatsPanelOpen,
   });
   const sessionBusy = agentRunning || bashRunning;
+
+  // Auto read-aloud: speak the latest assistant message when a prompt completes.
+  const readAloudEnabled = readAloud.enabled;
+  const readAloudSpeak = readAloud.speak;
+  const prevAgentRunningRef = useRef(agentRunning);
+  useEffect(() => {
+    const wasRunning = prevAgentRunningRef.current;
+    prevAgentRunningRef.current = agentRunning;
+    if (!wasRunning || agentRunning) return;
+    if (!completionNotificationsEnabled || !readAloudEnabled) return;
+    const latest = [...messages].reverse().find((m) => m.role === "assistant" && getAssistantProseText(m));
+    if (latest) void readAloudSpeak(getAssistantProseText(latest));
+  }, [agentRunning, messages, completionNotificationsEnabled, readAloudEnabled, readAloudSpeak]);
 
   useEffect(() => {
     if (
@@ -594,7 +619,12 @@ export function ChatWindow({ session, sessionRunning, newSessionCwd, newSessionD
       onBuiltinCommand={handleBuiltinSlashCommand}
       soundEnabled={soundEnabled}
       onSoundToggle={onSoundToggle}
-      onAudioUnlock={unlockAudio}
+      onAudioUnlock={() => { unlockAudio?.(); readAloud.unlockAudio(); }}
+      readAloudEnabled={readAloud.enabled}
+      onReadAloudToggle={() => readAloud.setEnabled(!readAloud.enabled)}
+      readAloudVoices={readAloud.voices}
+      readAloudVoice={readAloud.voice}
+      onReadAloudVoiceChange={readAloud.setVoice}
       draftKey={session?.id ?? newSessionDraftKey ?? undefined}
       cwd={session?.cwd ?? newSessionCwd}
     />
@@ -798,6 +828,8 @@ export function ChatWindow({ session, sessionRunning, newSessionCwd, newSessionD
                     prevTimestamp={idx > 0 ? (messages[idx - 1] as AgentMessage & { timestamp?: number }).timestamp : undefined}
                     sessionId={session?.id ?? sessionIdRef.current ?? undefined}
                     writtenFiles={options.writtenFiles}
+                    onReadAloud={readAloud.speak}
+                    readingAloud={readAloud.speaking}
                   />
                 );
                 if (!isVisible || options.attachRef === false || currentRefIdx === undefined) return view;

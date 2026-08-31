@@ -77,6 +77,11 @@ interface Props {
   soundEnabled?: boolean;
   onSoundToggle?: () => void;
   onAudioUnlock?: () => void;
+  readAloudEnabled?: boolean;
+  onReadAloudToggle?: () => void;
+  readAloudVoices?: string[];
+  readAloudVoice?: string;
+  onReadAloudVoiceChange?: (voice: string) => void;
   draftKey?: string;
   /** Session working directory — enables the @ file autocomplete menu */
   cwd?: string | null;
@@ -445,6 +450,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
   slashCommands, slashCommandsLoading, onLoadSlashCommands,
   onBuiltinCommand,
   soundEnabled, onSoundToggle, onAudioUnlock,
+  readAloudEnabled, onReadAloudToggle, readAloudVoices, readAloudVoice, onReadAloudVoiceChange,
   onPromptWithStreamingBehavior,
   draftKey,
   cwd,
@@ -2448,6 +2454,57 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
                   <rect x="1.5" y="1.5" width="7" height="7" rx="1.5" fill="currentColor" />
                 </svg>
                  {t("chat.stop")}
+              </button>
+            )}
+
+            {(readAloudVoices?.length ?? 0) > 0 && onReadAloudVoiceChange !== undefined && (
+              <select
+                value={readAloudVoice}
+                onChange={(e) => onReadAloudVoiceChange(e.target.value)}
+                title={t("chat.readAloudVoice")}
+                aria-label={t("chat.readAloudVoice")}
+                style={{
+                  height: 30,
+                  maxWidth: 140,
+                  padding: "0 6px",
+                  background: "var(--bg-panel)",
+                  border: "1px solid var(--border)",
+                  borderRadius: 8,
+                  color: "var(--text)",
+                  fontSize: 12,
+                  fontFamily: "var(--font-mono)",
+                  cursor: "pointer",
+                }}
+              >
+                {readAloudVoices!.map((v) => (
+                  <option key={v} value={v}>{v.replace(/^en_US-/, "").replace(/-medium$/, "")}</option>
+                ))}
+              </select>
+            )}
+
+            {onReadAloudToggle !== undefined && (
+              <button
+                type="button"
+                onClick={onReadAloudToggle}
+                title={readAloudEnabled ? t("chat.disableReadAloud") : t("chat.enableReadAloud")}
+                aria-label={readAloudEnabled ? t("chat.disableReadAloud") : t("chat.enableReadAloud")}
+                style={{
+                  display: "flex", alignItems: "center", justifyContent: "center",
+                  width: 32, height: 32, padding: 0,
+                  background: "none", border: "none", borderRadius: 9,
+                  color: readAloudEnabled ? "var(--text-muted)" : "var(--text-dim)",
+                  cursor: "pointer",
+                  opacity: readAloudEnabled ? 1 : 0.55,
+                  transition: "background 0.12s, color 0.12s, opacity 0.12s",
+                }}
+                onMouseEnter={(e) => { e.currentTarget.style.background = "var(--bg-hover)"; e.currentTarget.style.color = "var(--text)"; e.currentTarget.style.opacity = "1"; }}
+                onMouseLeave={(e) => { e.currentTarget.style.background = "none"; e.currentTarget.style.color = readAloudEnabled ? "var(--text-muted)" : "var(--text-dim)"; e.currentTarget.style.opacity = readAloudEnabled ? "1" : "0.55"; }}
+              >
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M3 14v-1a9 9 0 0 1 18 0v1" />
+                  <path d="M3 14h3a2 2 0 0 1 2 2v3a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-5z" />
+                  <path d="M21 14h-3a2 2 0 0 0-2 2v3a2 2 0 0 0 2 2h1a2 2 0 0 0 2-2v-5z" />
+                </svg>
               </button>
             )}
 
