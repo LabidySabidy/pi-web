@@ -4,7 +4,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { encodeWav, resampleTo16k } from "@/lib/audio";
 
 const TARGET_RATE = 16000;
-const ROLLING_SECONDS = 1.2;
+const ROLLING_SECONDS = 2;
 const KWS_POLL_MS = 400;
 // Best-effort trailing trim; the keyword text strip is the reliable layer.
 const TRAILING_TRIM_SAMPLES = Math.round(TARGET_RATE * 1.5);
