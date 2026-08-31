@@ -60,3 +60,6 @@ e2e_*.mjs
 
 # piper TTS engine: venv + downloaded voices
 /piper/
+
+# throwaway voice test artifacts
+/.ks/
