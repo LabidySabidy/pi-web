@@ -828,8 +828,8 @@ export function ChatWindow({ session, sessionRunning, newSessionCwd, newSessionD
                     prevTimestamp={idx > 0 ? (messages[idx - 1] as AgentMessage & { timestamp?: number }).timestamp : undefined}
                     sessionId={session?.id ?? sessionIdRef.current ?? undefined}
                     writtenFiles={options.writtenFiles}
-                    onReadAloud={readAloud.speak}
-                    readingAloud={readAloud.speaking}
+                    onReadAloud={readAloud.toggle}
+                    readingText={readAloud.speakingText}
                   />
                 );
                 if (!isVisible || options.attachRef === false || currentRefIdx === undefined) return view;

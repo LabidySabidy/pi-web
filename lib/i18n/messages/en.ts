@@ -362,6 +362,7 @@ export const enLocale: LocalePlugin = {
     "i18n.copied": "Copied",
     "i18n.readAloud": "Read aloud",
     "i18n.reading": "Reading…",
+    "i18n.stopReadAloud": "Stop reading",
     "i18n.cancel": "Cancel",
     "i18n.save": "Save",
     "i18n.saving": "Saving…",

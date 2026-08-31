@@ -362,6 +362,7 @@ export const zhCNLocale: LocalePlugin = {
     "i18n.copied": "已复制",
     "i18n.readAloud": "朗读",
     "i18n.reading": "朗读中…",
+    "i18n.stopReadAloud": "停止朗读",
     "i18n.cancel": "取消",
     "i18n.save": "保存",
     "i18n.saving": "保存中…",

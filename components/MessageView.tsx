@@ -201,7 +201,7 @@ interface Props {
    */
   writtenFiles?: WrittenFile[];
   onReadAloud?: (text: string) => void;
-  readingAloud?: boolean;
+  readingText?: string | null;
 }
 
 function formatTime(ts?: number): string | null {
@@ -250,12 +250,12 @@ function haveSameRelevantToolResults(
   return true;
 }
 
-export const MessageView = memo(function MessageView({ message, isStreaming, toolResults, modelNames, cwd, onOpenFile, onOpenSession, entryId, onFork, forking, onNavigate, prevAssistantEntryId, onEditContent, showTimestamp, prevTimestamp, sessionId, writtenFiles, onReadAloud, readingAloud }: Props) {
+export const MessageView = memo(function MessageView({ message, isStreaming, toolResults, modelNames, cwd, onOpenFile, onOpenSession, entryId, onFork, forking, onNavigate, prevAssistantEntryId, onEditContent, showTimestamp, prevTimestamp, sessionId, writtenFiles, onReadAloud, readingText }: Props) {
   if (message.role === "user") {
     return <UserMessageView message={message as UserMessage} cwd={cwd} onOpenFile={onOpenFile} entryId={entryId} onFork={onFork} forking={forking} onNavigate={onNavigate} prevAssistantEntryId={prevAssistantEntryId} onEditContent={onEditContent} />;
   }
   if (message.role === "assistant") {
-    return <AssistantMessageView message={message as AssistantMessage} isStreaming={isStreaming} toolResults={toolResults} modelNames={modelNames} cwd={cwd} onOpenFile={onOpenFile} onOpenSession={onOpenSession} showTimestamp={showTimestamp} prevTimestamp={prevTimestamp} sessionId={sessionId} entryId={entryId} writtenFiles={writtenFiles} onReadAloud={onReadAloud} readingAloud={readingAloud} />;
+    return <AssistantMessageView message={message as AssistantMessage} isStreaming={isStreaming} toolResults={toolResults} modelNames={modelNames} cwd={cwd} onOpenFile={onOpenFile} onOpenSession={onOpenSession} showTimestamp={showTimestamp} prevTimestamp={prevTimestamp} sessionId={sessionId} entryId={entryId} writtenFiles={writtenFiles} onReadAloud={onReadAloud} readingText={readingText} />;
   }
   if (message.role === "toolResult") {
     // Rendered inline under its toolCall — skip standalone rendering if paired
@@ -289,7 +289,7 @@ export const MessageView = memo(function MessageView({ message, isStreaming, too
     && prev.prevTimestamp === next.prevTimestamp
     && prev.sessionId === next.sessionId
     && prev.onReadAloud === next.onReadAloud
-    && prev.readingAloud === next.readingAloud;
+    && prev.readingText === next.readingText;
 });
 
 function UserMessageView({ message, cwd, onOpenFile, entryId, onFork, forking, onNavigate, prevAssistantEntryId, onEditContent }: {
@@ -587,7 +587,7 @@ function AssistantMessageView({
   entryId,
   writtenFiles,
   onReadAloud,
-  readingAloud,
+  readingText,
 }: {
   message: AssistantMessage;
   isStreaming?: boolean;
@@ -602,7 +602,7 @@ function AssistantMessageView({
   entryId?: string;
   writtenFiles?: WrittenFile[];
   onReadAloud?: (text: string) => void;
-  readingAloud?: boolean;
+  readingText?: string | null;
 }) {
   const { t } = useI18n();
   const time = showTimestamp ? formatTime(message.timestamp) : null;
@@ -669,6 +669,8 @@ function AssistantMessageView({
     .filter((b): b is TextContent => b.type === "text")
     .map((b) => b.text)
     .join("\n");
+
+  const isReading = readingText != null && readingText === textContent.trim();
 
   const copyContent = () => {
     copyText(textContent).then(() => {
@@ -820,29 +822,29 @@ function AssistantMessageView({
         {textContent && !isStreaming && onReadAloud && (
           <button
             onClick={() => onReadAloud(textContent)}
-            title={t("i18n.readAloud")}
+            title={isReading ? t("i18n.stopReadAloud") : t("i18n.readAloud")}
             style={{
               display: "flex", alignItems: "center", gap: 4,
               padding: "3px 8px", height: 22,
               background: "none", border: "none",
               borderRadius: 5,
-              color: readingAloud ? "var(--accent)" : "var(--text-dim)",
+              color: isReading ? "var(--accent)" : "var(--text-dim)",
               cursor: "pointer",
               fontSize: 11, fontWeight: 400,
               whiteSpace: "nowrap",
-              opacity: hovered || readingAloud ? 1 : 0,
-              pointerEvents: hovered || readingAloud ? "auto" : "none",
+              opacity: hovered || isReading ? 1 : 0,
+              pointerEvents: hovered || isReading ? "auto" : "none",
               transition: "opacity 0.12s, color 0.12s",
             }}
-            onMouseEnter={(e) => { if (!readingAloud) e.currentTarget.style.color = "var(--accent)"; }}
-            onMouseLeave={(e) => { if (!readingAloud) e.currentTarget.style.color = "var(--text-dim)"; }}
+            onMouseEnter={(e) => { if (!isReading) e.currentTarget.style.color = "var(--accent)"; }}
+            onMouseLeave={(e) => { if (!isReading) e.currentTarget.style.color = "var(--text-dim)"; }}
           >
             <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
               <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5" />
               <path d="M15.54 8.46a5 5 0 0 1 0 7.07" />
               <path d="M19.07 4.93a10 10 0 0 1 0 14.14" />
             </svg>
-            {readingAloud ? t("i18n.reading") : t("i18n.readAloud")}
+            {isReading ? t("i18n.reading") : t("i18n.readAloud")}
           </button>
         )}
         {textContent && !isStreaming && (

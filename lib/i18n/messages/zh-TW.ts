@@ -362,6 +362,7 @@ export const zhTWLocale: LocalePlugin = {
     "i18n.copied": "已複製",
     "i18n.readAloud": "朗讀",
     "i18n.reading": "朗讀中…",
+    "i18n.stopReadAloud": "停止朗讀",
     "i18n.cancel": "取消",
     "i18n.save": "儲存",
     "i18n.saving": "儲存中…",
