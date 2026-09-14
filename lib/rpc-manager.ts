@@ -236,7 +236,7 @@ export class AgentSessionWrapper {
   // staleness or an uncaptured stdout rather than at the emit itself). Authorship INFERENCE is
   // definitively unworkable — setThinkingLevel is called by model switches and level cycling with
   // no user action (agent-session.js:1215/1254/1277/1321) — so the design was abandoned rather
-  // than patched. See the harness's LESSONS.md (GL-029) before retrying.
+  // than patched. See the harness's LESSONS.md (GL-030) before retrying.
 
   constructor(
     public readonly inner: AgentSessionLike,
@@ -800,7 +800,7 @@ export class AgentSessionWrapper {
         // an observable effect end-to-end and the cause was never identified. Authorship
         // inference is unworkable (setThinkingLevel is called by model switches and level
         // cycling with no user action), which is why the design was abandoned rather than
-        // patched. See the harness's LESSONS.md (GL-029) if this is ever retried.
+        // patched. See the harness's LESSONS.md (GL-030) if this is ever retried.
         invalidateSessionListCache();
         return null;
       }
