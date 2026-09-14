@@ -228,6 +228,45 @@ export class AgentSessionWrapper {
   private forceShutdownOnIdle = false;
   private _alive = true;
 
+  /**
+   * Declare that the USER asserted a thinking level, so extensions do not have to infer it.
+   *
+   * pi emits `thinking_level_select` only when the level actually changes
+   * (agent-session.js:1300 gates it on `isChanging`), so a re-selection of the level already
+   * in force is invisible. Worse for inference, `setThinkingLevel` is also called by model
+   * switches and level cycling with no user action (agent-session.js:1215/1254/1277/1321),
+   * and on a genuine change pi's event and ours would be byte-identical.
+   *
+   * So authorship is DECLARED, not derived: `asserted: true` is present only on this emit.
+   * Fire-and-forget — the caller must not be blocked or failed by an extension.
+   */
+  private emitThinkingLevelAsserted(level: string, previousLevel: string | undefined): void {
+    try {
+      // Widened locally rather than in ExtensionRunnerLike: pi's real emit is generic over
+      // `RunnerEmitEvent`, so declaring a narrower structural parameter there makes pi's own
+      // AgentSession unassignable (TS2345 at three call sites). This is the only call site
+      // that needs a shape outside the interface's declared literal.
+      const runner = this.inner.extensionRunner as
+        | { emit?: (event: { type: string } & Record<string, unknown>) => Promise<unknown> }
+        | undefined;
+      const emit = runner?.emit;
+      if (typeof emit !== "function") return;
+      const effective = (this.inner.agent?.state?.thinkingLevel as string | undefined) ?? level;
+      void Promise.resolve(
+        emit.call(runner, {
+          type: "thinking_level_select",
+          level: effective,
+          previousLevel,
+          asserted: true,
+        }),
+      ).catch(() => {
+        /* an unreachable extension must not fail the command */
+      });
+    } catch {
+      /* fail-open: a dropped assertion loses an override, it must not throw into dispatch */
+    }
+  }
+
   constructor(
     public readonly inner: AgentSessionLike,
     options: AgentSessionWrapperOptions = {},
@@ -770,6 +809,10 @@ export class AgentSessionWrapper {
 
       case "set_thinking_level": {
         const level = command.level as string;
+        // Sample the in-force level BEFORE the write: setThinkingLevel overwrites
+        // agent.state.thinkingLevel in place, so this is the only moment it exists.
+        // (pi does the same at agent-session.js:1294.)
+        const previous = this.inner.agent?.state?.thinkingLevel as string | undefined;
         this.inner.setThinkingLevel(level);
         // setThinkingLevel clamps xhigh→high for models where supportsXhigh()===false.
         // If the model has DeepSeek thinking compat (reasoningEffortMap maps xhigh→max),
@@ -777,6 +820,12 @@ export class AgentSessionWrapper {
         if (level === "xhigh" && (this.inner.model as { compat?: { thinkingFormat?: string } } | null)?.compat?.thinkingFormat === "deepseek" && this.inner.agent?.state) {
           this.inner.agent.state.thinkingLevel = "xhigh";
         }
+        // Re-emit the level-select event UNCONDITIONALLY, which pi itself does not: its
+        // emit is gated on `isChanging`, so a user re-selecting the level already in force
+        // produces no event at all. `asserted: true` distinguishes this from pi's own
+        // emits (model switches, level cycling), which the extension must not read as
+        // user intent. `level` is read back so it reflects any clamp.
+        this.emitThinkingLevelAsserted(level, previous);
         invalidateSessionListCache();
         return null;
       }
