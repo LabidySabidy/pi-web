@@ -814,9 +814,16 @@ export class AgentSessionWrapper {
         // (pi does the same at agent-session.js:1294.)
         const previous = this.inner.agent?.state?.thinkingLevel as string | undefined;
         this.inner.setThinkingLevel(level);
-        // setThinkingLevel clamps xhigh→high for models where supportsXhigh()===false.
-        // If the model has DeepSeek thinking compat (reasoningEffortMap maps xhigh→max),
-        // force the state back so the compat layer can use it correctly.
+        // For models with DeepSeek thinking compat, `xhigh` is not a supported level (the map has
+        // no `xhigh` key, so getSupportedThinkingLevels omits it and clampThinkingLevel scans
+        // forward, landing on `max` — NOT `high`). If such a model is selected, force the state
+        // to `xhigh` so the compat layer maps it to `max` effort.
+        // REACHABILITY: no bundled model has thinkingFormat "deepseek" AND a non-null
+        // thinkingLevelMap.xhigh, and the sidebar only renders levels from
+        // getSupportedThinkingLevels — so this is not reachable from the UI, only from a direct
+        // RPC. Left in place deliberately: it is a workaround for a model that may be added.
+        // Note `xhigh` is not a level the model supports, so a read-back of
+        // agent.state.thinkingLevel will report it (openai-completions resolves it via the map).
         if (level === "xhigh" && (this.inner.model as { compat?: { thinkingFormat?: string } } | null)?.compat?.thinkingFormat === "deepseek" && this.inner.agent?.state) {
           this.inner.agent.state.thinkingLevel = "xhigh";
         }
