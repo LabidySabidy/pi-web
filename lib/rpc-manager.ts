@@ -250,7 +250,14 @@ export class AgentSessionWrapper {
         | { emit?: (event: { type: string } & Record<string, unknown>) => Promise<unknown> }
         | undefined;
       const emit = runner?.emit;
-      if (typeof emit !== "function") return;
+      if (typeof emit !== "function") {
+        // Never throw into dispatch, but never fail silently either: a missing emit is why an
+        // assertion can vanish with no trace anywhere, which is what made this feature look broken.
+        console.warn(
+          "[pi-web] thinking_level_select was not delivered: extensionRunner.emit is unavailable",
+        );
+        return;
+      }
       const effective = (this.inner.agent?.state?.thinkingLevel as string | undefined) ?? level;
       void Promise.resolve(
         emit.call(runner, {
@@ -259,11 +266,12 @@ export class AgentSessionWrapper {
           previousLevel,
           asserted: true,
         }),
-      ).catch(() => {
-        /* an unreachable extension must not fail the command */
+      ).catch((err: unknown) => {
+        // The rejection IS the proof-of-delivery; discarding it is what hid the failure.
+        console.error("[pi-web] thinking_level_select emit rejected:", err);
       });
-    } catch {
-      /* fail-open: a dropped assertion loses an override, it must not throw into dispatch */
+    } catch (err) {
+      console.error("[pi-web] thinking_level_select assertion failed:", err);
     }
   }
 
