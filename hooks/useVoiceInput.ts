@@ -8,6 +8,11 @@ const ROLLING_SECONDS = 2;
 const KWS_POLL_MS = 400;
 // Best-effort trailing trim; the keyword text strip is the reliable layer.
 const TRAILING_TRIM_SAMPLES = Math.round(TARGET_RATE * 1.5);
+// Silence auto-finalize fallback: after this many seconds without speech,
+// finalize as if the user said the end word.
+const SILENCE_FINALIZE_SECONDS = 5;
+// Raw RMS threshold (~-40 dBFS): speech sits above, room tone below.
+const SILENCE_RMS_THRESHOLD = 0.01;
 const STORAGE_KEY = "pi-voice-input-enabled";
 
 export type VoiceInputPhase = "idle" | "armed" | "recording" | "transcribing";
@@ -50,8 +55,8 @@ function stripKeyword(text: string): string {
 }
 
 /**
- * Continuous voice input: listen for "jarvis" (wake), record freely (silence
- * tolerated), listen for "finalize" (stop), then transcribe and auto-send.
+ * Continuous voice input: listen for "jarvis" (wake), record freely, stop on
+ * "finalize" (or 5s of silence), then transcribe and auto-send.
  */
 export function useVoiceInput(onSend: (text: string) => void) {
   const [enabled, setEnabledState] = useState<boolean>(() => {
@@ -67,6 +72,8 @@ export function useVoiceInput(onSend: (text: string) => void) {
   const rollingRef = useRef<Float32Array[]>([]);
   const recordingRef = useRef<Float32Array[]>([]);
   const kwsInFlightRef = useRef(false);
+  const recordingSampleCountRef = useRef(0);
+  const lastSpeechSampleCountRef = useRef(0);
 
   const setEnabled = useCallback((next: boolean) => {
     setEnabledState(next);
@@ -77,10 +84,14 @@ export function useVoiceInput(onSend: (text: string) => void) {
     }
   }, []);
 
-  const finalize = useCallback(() => {
+  const finalize = useCallback((cutAtSamples?: number) => {
     const chunks = recordingRef.current;
     recordingRef.current = [];
-    const all = concat(chunks);
+    recordingSampleCountRef.current = 0;
+    let all = concat(chunks);
+    if (cutAtSamples !== undefined && cutAtSamples < all.length) {
+      all = all.subarray(0, cutAtSamples);
+    }
     if (all.length === 0) {
       phaseRef.current = "armed";
       setPhase("armed");
@@ -91,7 +102,9 @@ export function useVoiceInput(onSend: (text: string) => void) {
     setError(null);
     const rate = sampleRateRef.current;
     const at16k = rate === TARGET_RATE ? all : resampleTo16k(all, rate);
-    const trimmed = at16k.length > TRAILING_TRIM_SAMPLES
+    // Only the keyword path trims the trailing "finalize" word; the silence
+    // fallback already cuts at the last detected speech.
+    const trimmed = cutAtSamples === undefined && at16k.length > TRAILING_TRIM_SAMPLES
       ? at16k.subarray(0, at16k.length - TRAILING_TRIM_SAMPLES)
       : at16k;
     const wav = encodeWav(trimmed, TARGET_RATE);
@@ -137,6 +150,8 @@ export function useVoiceInput(onSend: (text: string) => void) {
       if (detected === "jarvis" && current === "armed") {
         rollingRef.current = [];
         recordingRef.current = [];
+        recordingSampleCountRef.current = 0;
+        lastSpeechSampleCountRef.current = 0;
         phaseRef.current = "recording";
         setPhase("recording");
       } else if (detected === "finalize" && current === "recording") {
@@ -177,6 +192,16 @@ export function useVoiceInput(onSend: (text: string) => void) {
           }
           if (phaseRef.current === "recording") {
             recordingRef.current.push(data);
+            recordingSampleCountRef.current += data.length;
+            // Voice-activity detection for the silence auto-finalize fallback.
+            let sum = 0;
+            for (let i = 0; i < data.length; i++) {
+              const v = data[i];
+              sum += v * v;
+            }
+            if (Math.sqrt(sum / data.length) >= SILENCE_RMS_THRESHOLD) {
+              lastSpeechSampleCountRef.current = recordingSampleCountRef.current;
+            }
           }
         };
         const source = ctx.createMediaStreamSource(stream);
@@ -188,6 +213,15 @@ export function useVoiceInput(onSend: (text: string) => void) {
 
         timer = setInterval(() => {
           void pollKws();
+          // Silence fallback: after SILENCE_FINALIZE_SECONDS without speech,
+          // finalize as if the user said the end word.
+          if (
+            phaseRef.current === "recording"
+            && recordingSampleCountRef.current - lastSpeechSampleCountRef.current
+              >= sampleRateRef.current * SILENCE_FINALIZE_SECONDS
+          ) {
+            finalize(lastSpeechSampleCountRef.current);
+          }
         }, KWS_POLL_MS);
         phaseRef.current = "armed";
         setPhase("armed");
@@ -205,12 +239,14 @@ export function useVoiceInput(onSend: (text: string) => void) {
       void ctx?.close();
       rollingRef.current = [];
       recordingRef.current = [];
+      recordingSampleCountRef.current = 0;
+      lastSpeechSampleCountRef.current = 0;
       if (phaseRef.current !== "transcribing") {
         phaseRef.current = "idle";
         setPhase("idle");
       }
     };
-  }, [enabled, pollKws]);
+  }, [enabled, pollKws, finalize]);
 
   return { enabled, setEnabled, phase, lastDetected, error };
 }

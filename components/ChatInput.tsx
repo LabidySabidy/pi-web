@@ -534,9 +534,6 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
     });
   }, []);
 
-  const dictation = useDictation(insertText);
-  const dictationRecording = dictation.phase === "recording";
-  const dictationTranscribing = dictation.phase === "transcribing";
   const voiceInput = useVoiceInput(onSend);
 
   useImperativeHandle(ref, () => ({
@@ -822,6 +819,30 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
     clearInput();
     onSend(msg, attachedImages.length ? attachedImages : undefined);
   }, [value, attachedImages, isStreaming, runBuiltinCommand, onSend, clearInput, onAudioUnlock]);
+
+  // Dictation auto-sends on stop. Compute the message from valueRef (which
+  // mirrors the current input) rather than round-tripping through the textarea,
+  // then mirror the Enter key: queue as a follow-up while streaming, otherwise
+  // send immediately.
+  const handleDictatedText = useCallback((text: string) => {
+    const trimmed = text.trim();
+    if (!trimmed) return;
+    const existing = valueRef.current.trim();
+    const msg = existing ? `${existing} ${trimmed}` : trimmed;
+    onAudioUnlock?.();
+    clearInput();
+    const images = attachedImagesRef.current.length ? attachedImagesRef.current : undefined;
+    if (isStreaming) {
+      if (onFollowUp) onFollowUp(msg, images);
+      else if (onSteer) onSteer(msg, images);
+    } else {
+      onSend(msg, images);
+    }
+  }, [isStreaming, onAudioUnlock, onFollowUp, onSteer, onSend, clearInput]);
+
+  const dictation = useDictation(handleDictatedText);
+  const dictationRecording = dictation.phase === "recording";
+  const dictationTranscribing = dictation.phase === "transcribing";
 
   const slashQuery = value.startsWith("/") && !/\s/.test(value.slice(1))
     ? value.slice(1).toLowerCase()
