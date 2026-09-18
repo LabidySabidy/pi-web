@@ -31,6 +31,9 @@ import { DictationButton } from "./DictationButton";
 import { DictationLevelMeter, DictationProcessing } from "./DictationLevel";
 import { useDictation } from "@/hooks/useDictation";
 import { useVoiceInput } from "@/hooks/useVoiceInput";
+import { useLiveConversation } from "@/hooks/useLiveConversation";
+import { LiveConversationButton } from "./LiveConversationButton";
+import { classifyVoiceIntent } from "@/lib/voice-intent-model";
 
 export { filterModelOptions } from "./ModelSelector";
 
@@ -47,6 +50,8 @@ interface Props {
   onFollowUp?: (message: string, images?: AttachedImage[]) => void;
   onPromptWithStreamingBehavior?: (message: string, behavior: "steer" | "followUp", images?: AttachedImage[]) => void;
   isStreaming: boolean;
+  /** Session id for Live Conversation's status queries. Absent on a new draft. */
+  sessionId?: string;
   model?: { provider: string; modelId: string } | null;
   isAutoModelSelection?: boolean;
   modelNames?: Record<string, string>;
@@ -444,7 +449,7 @@ export function ModelScopeWarningBanner({ warnings }: { warnings?: string[] }) {
 }
 
 export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
-  onSend, onAbort, onSteer, onFollowUp, isStreaming, model, isAutoModelSelection, modelNames, modelList, modelError, modelScopeWarnings, onModelChange, modelSwitching,
+  onSend, onAbort, onSteer, onFollowUp, isStreaming, sessionId: liveSessionId, model, isAutoModelSelection, modelNames, modelList, modelError, modelScopeWarnings, onModelChange, modelSwitching,
   onCompact, onAbortCompaction, isCompacting, compactError, compactResult, toolPreset, onToolPresetChange,
   thinkingLevel, onThinkingLevelChange, availableThinkingLevels, thinkingLevelMap,
   retryInfo, queuedMessages, inputHistory = [], onRecallQueue,
@@ -457,6 +462,12 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
   cwd,
 }: Props, ref) {
   const { t } = useI18n();
+
+  // Mirrors isStreaming so callbacks that outlive a render (Live mode's
+  // classifier reads this after transcription, up to seconds later) see the
+  // current truth rather than a stale closure value.
+  const isStreamingRef = useRef(isStreaming);
+  isStreamingRef.current = isStreaming;
   const isMobile = useIsMobile();
   const [value, setValue] = useState(() => (draftKey ? getDraft(draftKey)?.value ?? "" : ""));
   const [toolDropdownOpen, setToolDropdownOpen] = useState(false);
@@ -843,6 +854,22 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
   const dictation = useDictation(handleDictatedText);
   const dictationRecording = dictation.phase === "recording";
   const dictationTranscribing = dictation.phase === "transcribing";
+
+  // Live Conversation: open-mic, classified routing, spoken replies. Routed
+  // through the same callbacks the composer uses, so a spoken instruction lands
+  // exactly as a typed one would -- steer and follow-up included.
+  const live = useLiveConversation({
+    sessionId: liveSessionId,
+    // Read from a ref, not the render value: the classifier must see whether a
+    // turn is streaming at the moment the utterance is transcribed, which can
+    // be a second or more after the render that captured this closure.
+    isStreaming: () => isStreamingRef.current,
+    onPrompt: (text) => onSend(text),
+    onSteer: (text) => (onSteer ? onSteer(text) : onSend(text)),
+    onFollowUp: (text) => (onFollowUp ? onFollowUp(text) : onSend(text)),
+    onAbort,
+    classify: classifyVoiceIntent,
+  });
 
   const slashQuery = value.startsWith("/") && !/\s/.test(value.slice(1))
     ? value.slice(1).toLowerCase()
@@ -2560,6 +2587,8 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
             </button>
 
             <DictationButton dictation={dictation} />
+
+            <LiveConversationButton live={live} />
 
             {onSoundToggle !== undefined && (
               <button

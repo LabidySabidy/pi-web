@@ -607,6 +607,7 @@ export function ChatWindow({ session, sessionRunning, newSessionCwd, newSessionD
       onFollowUp={agentRunning ? handleFollowUp : undefined}
       onPromptWithStreamingBehavior={agentRunning ? handlePromptWithStreamingBehavior : undefined}
       isStreaming={sessionBusy}
+      sessionId={session?.id ?? sessionIdRef.current ?? undefined}
       model={displayModelValue}
       isAutoModelSelection={isAutoModelSelection}
       modelNames={modelNames}
