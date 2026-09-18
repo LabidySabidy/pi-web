@@ -1,0 +1,138 @@
+{
+  "tensors": [
+    {
+      "name": "decoder.decoder.2.bias",
+      "shape": [
+        1
+      ],
+      "offset": 0,
+      "length": 1
+    },
+    {
+      "name": "decoder.decoder.2.weight",
+      "shape": [
+        1,
+        128,
+        1
+      ],
+      "offset": 1,
+      "length": 128
+    },
+    {
+      "name": "decoder.rnn.bias_hh",
+      "shape": [
+        512
+      ],
+      "offset": 129,
+      "length": 512
+    },
+    {
+      "name": "decoder.rnn.bias_ih",
+      "shape": [
+        512
+      ],
+      "offset": 641,
+      "length": 512
+    },
+    {
+      "name": "decoder.rnn.weight_hh",
+      "shape": [
+        512,
+        128
+      ],
+      "offset": 1153,
+      "length": 65536
+    },
+    {
+      "name": "decoder.rnn.weight_ih",
+      "shape": [
+        512,
+        128
+      ],
+      "offset": 66689,
+      "length": 65536
+    },
+    {
+      "name": "encoder.0.reparam_conv.bias",
+      "shape": [
+        128
+      ],
+      "offset": 132225,
+      "length": 128
+    },
+    {
+      "name": "encoder.0.reparam_conv.weight",
+      "shape": [
+        128,
+        129,
+        3
+      ],
+      "offset": 132353,
+      "length": 49536
+    },
+    {
+      "name": "encoder.1.reparam_conv.bias",
+      "shape": [
+        64
+      ],
+      "offset": 181889,
+      "length": 64
+    },
+    {
+      "name": "encoder.1.reparam_conv.weight",
+      "shape": [
+        64,
+        128,
+        3
+      ],
+      "offset": 181953,
+      "length": 24576
+    },
+    {
+      "name": "encoder.2.reparam_conv.bias",
+      "shape": [
+        64
+      ],
+      "offset": 206529,
+      "length": 64
+    },
+    {
+      "name": "encoder.2.reparam_conv.weight",
+      "shape": [
+        64,
+        64,
+        3
+      ],
+      "offset": 206593,
+      "length": 12288
+    },
+    {
+      "name": "encoder.3.reparam_conv.bias",
+      "shape": [
+        128
+      ],
+      "offset": 218881,
+      "length": 128
+    },
+    {
+      "name": "encoder.3.reparam_conv.weight",
+      "shape": [
+        128,
+        64,
+        3
+      ],
+      "offset": 219009,
+      "length": 24576
+    },
+    {
+      "name": "stft.forward_basis_buffer",
+      "shape": [
+        258,
+        1,
+        256
+      ],
+      "offset": 243585,
+      "length": 66048
+    }
+  ]
+}
