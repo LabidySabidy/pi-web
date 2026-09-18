@@ -73,7 +73,20 @@ export function useDictation(onText: (text: string) => void): DictationState {
     const constraints: MediaStreamConstraints = {
       audio: {
         deviceId: deviceId ? { exact: deviceId } : undefined,
-        echoCancellation: false,
+        // "all" cancels ALL system playout from the mic signal, not just audio
+        // arriving over RTCPeerConnection. That distinction is the whole fix:
+        // Chrome's AEC ignores locally-generated WebAudio by default, and
+        // read-aloud plays through an AudioContext (useReadAloud.ts), so with
+        // plain `true` the mic recorded our own TTS and whisper transcribed it
+        // back in. Chromium 141+ honours "all"; older builds coerce it to true
+        // (i.e. remote-only), which is the pre-fix behaviour.
+        //
+        // Typed as `ConstrainBoolean` by TypeScript 5.9's lib.dom even though
+        // the spec (ConstrainBooleanOrDOMString) allows "all"/"remote-only",
+        // hence the cast. Drop it once lib.dom catches up.
+        echoCancellation: "all" as unknown as boolean,
+        // Kept off deliberately: Whisper wants the rawest signal, and AGC
+        // pumping / spectral noise gating hurt recognition more than they help.
         noiseSuppression: false,
         autoGainControl: false,
         channelCount: 1,
