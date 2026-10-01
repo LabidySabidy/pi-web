@@ -7,7 +7,18 @@ import { hasJsonContentType, isApiRequestAllowed } from "@/lib/request-security"
 export const dynamic = "force-dynamic";
 
 const SUMMARIZER_PROVIDER = "deepseek";
-const SUMMARIZER_MODEL = "deepseek-v4-flash";
+// A MODEL ID THAT DOES NOT EXIST FAILS AT CLICK TIME, NOT AT TEST TIME.
+//
+// This was `deepseek-v4-flash`, which appears in neither agent/models.json (`deepseek-flash`) nor
+// agent/models-store.json (`deepseek-flash`, `deepseek-v4-pro`). The route then threw
+// "Summarizer model not found: deepseek/deepseek-v4-flash" and read-aloud returned HTTP 500 — Piper
+// itself was fine, the voices endpoint answered 200, and the whole UI chain was intact, so the
+// failure looked like "read aloud is broken" without saying which half.
+//
+// The id is resolved through ModelRuntime, so a rename or a catalog change silently invalidates it.
+// `app/api/speak/route.test.mjs` now asserts this id is present in the resolved catalog, so the next
+// rename fails in the suite rather than in the browser.
+const SUMMARIZER_MODEL = "deepseek-flash";
 const MAX_INPUT_CHARS = 50_000;
 
 /** Build the plain-spoken condensation prompt for the summarizer. */
