@@ -2093,6 +2093,19 @@ export async function startRpcSession(
       },
     );
     if (persistedPreferences.modelDefaultChanged) invalidateModelsCache();
+    if (persistedPreferences.thinkingLevelDiverged) {
+      // The browser asked for a thinking level the session did not end up with, so nothing was
+      // written. That is deliberate (GL-033: the old code wrote the session's LIVE level instead, which
+      // could persist a transient value as the global default) — but it is worth knowing about, because
+      // a silent refusal and a silent wrong write look identical in a log that says nothing at all.
+      console.warn(
+        "[pi-web] requested thinking level",
+        thinkingLevel,
+        "but the session resolved",
+        inner.thinkingLevel,
+        "— not persisting a default (GL-033)",
+      );
+    }
 
     // If specific tool names were requested (non-empty), set the active tools to the
     // requested builtin coding tools PLUS all extension/package tools, so installed
