@@ -1,21 +1,50 @@
 "use client";
 
-import { useMemo, type MouseEvent } from "react";
-import ReactMarkdown, { type Components } from "react-markdown";
-import { resolveLocalFileHref } from "@/lib/file-links";
+import { createContext, useContext, useMemo, type ComponentProps, type MouseEvent } from "react";
+import ReactMarkdown, { type Components, type ExtraProps } from "react-markdown";
+import { parsePdfPageFragment, resolveLocalFileHref, shouldOpenLocalFileInApp } from "@/lib/file-links";
 import { encodeFilePathForApi } from "@/lib/file-paths";
-import { markdownRehypePlugins, markdownRemarkPlugins, normalizeDisplayMath } from "@/lib/markdown";
+import { markdownRehypePlugins, markdownRemarkPlugins, markdownUrlTransform, markdownUserRemarkPlugins, normalizeDisplayMath } from "@/lib/markdown";
+import { ImagePreview } from "./ImagePreview";
 import { MermaidBlock, CodeBlock } from "./MermaidBlock";
+
+const MarkdownLinkContext = createContext(false);
 
 interface MarkdownBodyProps {
   children: string;
   className?: string;
   isStreaming?: boolean;
   cwd?: string;
-  onOpenFile?: (filePath: string) => void;
+  onOpenFile?: (filePath: string, page?: number) => void;
+  /** Render every line ending as a line break, for text the user typed. */
+  keepLineBreaks?: boolean;
 }
 
-export function MarkdownBody({ children, className, isStreaming, cwd, onOpenFile }: MarkdownBodyProps) {
+function MarkdownImage({
+  src,
+  alt,
+  cwd,
+  ...props
+}: ComponentProps<"img"> & ExtraProps & { cwd?: string }) {
+  const insideLink = useContext(MarkdownLinkContext);
+  delete props.node;
+  const href = typeof src === "string" ? src : undefined;
+  const filePath = href ? resolveLocalFileHref(href, cwd) : null;
+  const imageSrc = filePath
+    ? `/api/files/${encodeFilePathForApi(filePath)}?type=read`
+    : href;
+  // Dynamic local paths are served directly by the file API.
+  // eslint-disable-next-line @next/next/no-img-element
+  const image = <img src={imageSrc} alt={alt ?? ""} loading="lazy" {...props} />;
+  if (!imageSrc || insideLink) return image;
+  return (
+    <ImagePreview src={imageSrc} alt={alt ?? ""} className="markdown-image">
+      {image}
+    </ImagePreview>
+  );
+}
+
+export function MarkdownBody({ children, className, isStreaming, cwd, onOpenFile, keepLineBreaks }: MarkdownBodyProps) {
   const normalizedMarkdown = useMemo(() => normalizeDisplayMath(children), [children]);
   // Stable renderer identities keep stateful blocks mounted across message hover updates.
   const components = useMemo<Components>(() => ({
@@ -25,7 +54,13 @@ export function MarkdownBody({ children, className, isStreaming, cwd, onOpenFile
       const isBlock = className?.includes("language-") || raw.includes("\n");
       if (isBlock) {
         if (lang === "mermaid") {
-          return <MermaidBlock code={raw.replace(/\n$/, "")} isStreaming={isStreaming} />;
+          return (
+            <MermaidBlock
+              code={raw.replace(/\n$/, "")}
+              isStreaming={isStreaming}
+              defaultPreview
+            />
+          );
         }
         return <CodeBlock code={raw.replace(/\n$/, "")} lang={lang} isStreaming={isStreaming} />;
       }
@@ -48,36 +83,32 @@ export function MarkdownBody({ children, className, isStreaming, cwd, onOpenFile
       const openFile = onOpenFile;
       if (!filePath || !openFile) {
         return (
-          <a href={href} {...props} target="_blank" rel="noopener noreferrer">
-            {children}
-          </a>
+          <MarkdownLinkContext.Provider value={true}>
+            <a href={href} {...props} target="_blank" rel="noopener noreferrer">
+              {children}
+            </a>
+          </MarkdownLinkContext.Provider>
         );
       }
 
       const handleClick = (event: MouseEvent<HTMLAnchorElement>) => {
-        if (event.defaultPrevented || event.button !== 0) return;
-        if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+        if (!shouldOpenLocalFileInApp(event)) return;
         const target = event.currentTarget.getAttribute("target");
         if (target && target !== "_self") return;
         event.preventDefault();
-        openFile(filePath);
+        openFile(filePath, parsePdfPageFragment(href) ?? undefined);
       };
 
       return (
-        <a href={href} {...props} onClick={handleClick}>
-          {children}
-        </a>
+        <MarkdownLinkContext.Provider value={true}>
+          <a href={href} {...props} onClick={handleClick}>
+            {children}
+          </a>
+        </MarkdownLinkContext.Provider>
       );
     },
-    img({ src, alt, ...props }) {
-      delete props.node;
-      const filePath = typeof src === "string" ? resolveLocalFileHref(src, cwd) : null;
-      const imageSrc = filePath
-        ? `/api/files/${encodeFilePathForApi(filePath)}?type=read`
-        : src;
-      // Dynamic local paths are served directly by the file API.
-      // eslint-disable-next-line @next/next/no-img-element
-      return <img src={imageSrc} alt={alt ?? ""} loading="lazy" {...props} />;
+    img(props) {
+      return <MarkdownImage cwd={cwd} {...props} />;
     },
     table({ children }) {
       return (
@@ -91,8 +122,9 @@ export function MarkdownBody({ children, className, isStreaming, cwd, onOpenFile
   return (
     <div className={["markdown-body", className].filter(Boolean).join(" ")}>
       <ReactMarkdown
-        remarkPlugins={markdownRemarkPlugins}
+        remarkPlugins={keepLineBreaks ? markdownUserRemarkPlugins : markdownRemarkPlugins}
         rehypePlugins={markdownRehypePlugins}
+        urlTransform={onOpenFile ? markdownUrlTransform : undefined}
         components={components}
       >
         {normalizedMarkdown}

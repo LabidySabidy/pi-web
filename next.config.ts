@@ -11,9 +11,41 @@ try {
   piVersion = (JSON.parse(readFileSync(piPkgPath, "utf8")) as { version: string }).version;
 } catch { /* package not found, use default */ }
 
+// mdast-util-gfm-autolink-literal (remark-gfm) ships a RegExp lookbehind that
+// Safari parses only from 16.4, which blanked `/` on iOS 16.2 (#753). The loader
+// swaps it for an equivalent built at runtime; both bundlers must run it.
+const gfmAutolinkEmailLoader = join(configDir, "lib/gfm-autolink-email-loader.cjs");
+
 const nextConfig: NextConfig = {
   outputFileTracingRoot: configDir,
+  experimental: {
+    // proxy.ts matches /api/:path*, and Next buffers the request body whenever
+    // a proxy is present, capped at 10 MB by default. The upload route accepts
+    // up to 100 MB per request, so raise the buffer above that or large uploads
+    // are truncated and fail with "Failed to parse body as FormData."
+    proxyClientMaxBodySize: "128mb",
+  },
+  // next/image is only used for the static logo, so the /_next/image optimizer
+  // (and its sharp/libheif attack surface, see GHSA-2xp9-vwfh-vxw4) is not needed.
+  images: { unoptimized: true },
+  // `next dev` runs Turbopack and `npm run build` runs webpack.
+  turbopack: {
+    rules: {
+      "**/mdast-util-gfm-autolink-literal/lib/index.js": { loaders: [gfmAutolinkEmailLoader] },
+    },
+  },
+  webpack(config) {
+    config.module.rules.push({
+      test: /[\\/]mdast-util-gfm-autolink-literal[\\/]lib[\\/]index\.js$/,
+      loader: gfmAutolinkEmailLoader,
+    });
+    return config;
+  },
+  // Node modules keep the syntax they ship unless listed here, and mermaid's
+  // lazy diagram chunks are full of class `static {}` blocks (#753).
+  transpilePackages: ["mermaid", "@mermaid-js/parser"],
   serverExternalPackages: [
+    "node-pty",
     "undici",
     "web-push",
     "@earendil-works/pi-coding-agent",

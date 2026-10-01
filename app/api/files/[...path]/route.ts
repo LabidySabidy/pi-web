@@ -2,40 +2,35 @@ import { NextRequest, NextResponse } from "next/server";
 import fs from "fs";
 import path from "path";
 import {
+  allowFileRoot,
   getAllowedFileRoots,
   isExistingFilePathAllowed,
   isFilePathAllowed,
-  isWindowsAbsolutePath,
-  normalizeSlashes,
 } from "@/lib/file-access";
+import { checkLinkedDirectoryApproval, withOutsideLinkTargets } from "@/lib/linked-directory";
 import {
   DOCX_PREVIEW_MAX_BYTES,
   IMAGE_PREVIEW_MAX_BYTES,
-  TEXT_PREVIEW_MAX_BYTES,
   documentPreviewKind,
   getAudioMime,
   getDocumentMime,
   getFileExt,
   getImageMime,
+  getVideoMime,
 } from "@/lib/file-types";
 import { resolveDirentIsDirectory } from "@/lib/file-dirent";
+import { getFileTreeVisibility } from "@/lib/file-tree-visibility";
 import { isFilePathReferencedBySession } from "@/lib/session-file-references";
-import { isApiRequestAllowed } from "@/lib/request-security";
+import { hasJsonContentType, isApiRequestAllowed } from "@/lib/request-security";
 import {
   inspectUploadTargets,
   parseUploadConflictStrategy,
   validateUploadFileNames,
 } from "@/lib/file-upload";
 import { parseFormDataWithinLimit, RequestBodyTooLargeError } from "@/lib/bounded-form-data";
-import { samePath } from "@/lib/paths";
-
-const IGNORED_NAMES = new Set([
-  "node_modules", ".git", ".next", "dist", "build", "__pycache__",
-  ".turbo", ".cache", "coverage", ".pytest_cache", ".mypy_cache",
-  "target", "vendor", ".DS_Store", ".git",
-]);
-
-const IGNORED_SUFFIXES = [".pyc"];
+import { filePathFromApiSegments, samePath } from "@/lib/paths";
+import { hasParentDirectorySegment } from "@/lib/path-security";
+import { readTextPreviewChunk } from "@/lib/text-preview";
 
 const FILE_REQUEST_TYPES = ["list", "read", "download", "meta", "preview", "watch"] as const;
 type FileRequestType = typeof FILE_REQUEST_TYPES[number];
@@ -70,13 +65,6 @@ function getLanguage(filePath: string): string {
   return EXT_TO_LANGUAGE[ext] ?? "text";
 }
 
-function filePathFromSegments(segments: string[]): string {
-  const joined = segments.join("/");
-  const slashJoined = normalizeSlashes(joined);
-  if (isWindowsAbsolutePath(slashJoined)) return slashJoined;
-  return "/" + joined.replace(/^\/+/, "");
-}
-
 function parseFileRequestType(value: string): FileRequestType | null {
   return FILE_REQUEST_TYPE_SET.has(value) ? (value as FileRequestType) : null;
 }
@@ -84,7 +72,7 @@ function parseFileRequestType(value: string): FileRequestType | null {
 async function getUploadDirectory(segments: string[]): Promise<
   { directory: string } | { response: NextResponse }
 > {
-  const directory = filePathFromSegments(segments);
+  const directory = filePathFromApiSegments(segments);
   const allowedRoots = await getAllowedFileRoots();
   if (!isFilePathAllowed(directory, allowedRoots)) {
     return { response: NextResponse.json({ error: "Access denied" }, { status: 403 }) };
@@ -118,6 +106,32 @@ async function getUploadDirectory(segments: string[]): Promise<
   return { directory: realDirectory };
 }
 
+// A directory link whose target is outside the allowed roots is listed but not
+// browsable. Allowing it is the operator's explicit choice, the same one as
+// selecting that directory as a workspace, and lasts until the server restarts.
+async function allowLinkedDirectory(
+  request: NextRequest,
+  segments: string[],
+): Promise<NextResponse> {
+  if (!hasJsonContentType(request)) {
+    return NextResponse.json({ error: "Content-Type must be application/json" }, { status: 415 });
+  }
+  const body = await request.json().catch(() => null) as { target?: unknown } | null;
+  if (typeof body?.target !== "string" || !body.target) {
+    return NextResponse.json({ error: "target must be the link target shown in the listing" }, { status: 400 });
+  }
+  const approval = checkLinkedDirectoryApproval(
+    filePathFromApiSegments(segments),
+    body.target,
+    await getAllowedFileRoots(),
+  );
+  if (!approval.ok) {
+    return NextResponse.json({ error: approval.error }, { status: approval.status });
+  }
+  if (!approval.alreadyAllowed) allowFileRoot(approval.target);
+  return NextResponse.json({ path: approval.target });
+}
+
 function parseUploadFileNames(value: unknown): string[] | null {
   if (!Array.isArray(value) || !value.every((item) => typeof item === "string")) return null;
   return value;
@@ -133,10 +147,12 @@ export async function POST(
 
   try {
     const { path: segments } = await params;
+    const type = request.nextUrl.searchParams.get("type") ?? "upload";
+    if (type === "allow-link") return allowLinkedDirectory(request, segments);
+
     const uploadDirectory = await getUploadDirectory(segments);
     if ("response" in uploadDirectory) return uploadDirectory.response;
     const { directory } = uploadDirectory;
-    const type = request.nextUrl.searchParams.get("type") ?? "upload";
 
     if (type === "upload-check") {
       const body = await request.json().catch(() => null) as { fileNames?: unknown } | null;
@@ -429,7 +445,16 @@ export async function GET(
 ) {
   try {
     const { path: segments } = await params;
-    const filePath = filePathFromSegments(segments);
+    const filePath = filePathFromApiSegments(segments);
+    // Authorization collapses `..` lexically, but the filesystem applies it
+    // after following links, so `link/../x` names a file beside the link's
+    // target, outside the roots. URL parsing already drops real `..` segments;
+    // only an encoded slash inside a segment still carries one here. The
+    // existing-path check refuses them too, but a file referenced by the
+    // session skips that check.
+    if (hasParentDirectorySegment(filePath)) {
+      return NextResponse.json({ error: "Access denied" }, { status: 403 });
+    }
     const rawType = request.nextUrl.searchParams.get("type") ?? "list";
     const type = parseFileRequestType(rawType);
     if (!type) {
@@ -479,23 +504,32 @@ export async function GET(
       if (audioMime) {
         return streamFile(filePath, stat, audioMime, request.headers.get("range"));
       }
+      const videoMime = getVideoMime(filePath);
+      if (videoMime) {
+        return streamFile(filePath, stat, videoMime, request.headers.get("range"));
+      }
       const documentMime = getDocumentMime(filePath);
       if (documentMime) {
         return streamFile(filePath, stat, documentMime, request.headers.get("range"));
       }
-      if (stat.size > TEXT_PREVIEW_MAX_BYTES) {
-        return NextResponse.json({ error: "File too large for preview (>256KB)" }, { status: 413 });
+      const rawOffset = request.nextUrl.searchParams.get("offset");
+      if (rawOffset !== null && !/^\d+$/.test(rawOffset)) {
+        return NextResponse.json({ error: "Invalid text preview offset" }, { status: 400 });
       }
-      const content = fs.readFileSync(filePath, "utf-8");
+      const offset = Number(rawOffset ?? 0);
+      if (!Number.isSafeInteger(offset) || offset > stat.size) {
+        return NextResponse.json({ error: "Invalid text preview offset" }, { status: 400 });
+      }
+      const chunk = readTextPreviewChunk(filePath, stat.size, offset);
       const language = getLanguage(filePath);
-      return NextResponse.json({ content, language, size: stat.size });
+      return NextResponse.json({ ...chunk, language, size: stat.size });
     }
 
     if (type === "download") {
       if (!stat?.isFile()) {
         return NextResponse.json({ error: "Not a file" }, { status: 400 });
       }
-      const mime = getImageMime(filePath) || getAudioMime(filePath) || getDocumentMime(filePath) || "application/octet-stream";
+      const mime = getImageMime(filePath) || getAudioMime(filePath) || getVideoMime(filePath) || getDocumentMime(filePath) || "application/octet-stream";
       return streamFile(filePath, stat, mime, request.headers.get("range"), true);
     }
 
@@ -505,11 +539,12 @@ export async function GET(
       }
       const imageMime = getImageMime(filePath);
       const audioMime = getAudioMime(filePath);
+      const videoMime = getVideoMime(filePath);
       const documentMime = getDocumentMime(filePath);
       return NextResponse.json({
         size: stat.size,
         language: getLanguage(filePath),
-        mime: imageMime || audioMime || documentMime || "text/plain",
+        mime: imageMime || audioMime || videoMime || documentMime || "text/plain",
         previewKind: documentPreviewKind(filePath),
       });
     }
@@ -630,8 +665,9 @@ export async function GET(
     // Avoid per-entry stat calls for normal files and directories. Symlinks and
     // filesystems without directory type information use the stat fallback.
     const dirents = fs.readdirSync(filePath, { withFileTypes: true });
+    const isVisible = await getFileTreeVisibility(filePath, dirents.map((d) => d.name));
     const entries = dirents
-      .filter((d) => !IGNORED_NAMES.has(d.name) && !IGNORED_SUFFIXES.some((s) => d.name.endsWith(s)))
+      .filter((d) => isVisible(d.name))
       .flatMap((d) => {
         const isDir = resolveDirentIsDirectory(d, path.join(filePath, d.name));
         return isDir === null
@@ -644,7 +680,10 @@ export async function GET(
         return a.name.localeCompare(b.name);
       });
 
-    return NextResponse.json({ entries, path: filePath });
+    return NextResponse.json({
+      entries: withOutsideLinkTargets(filePath, entries, dirents, allowedRoots),
+      path: filePath,
+    });
   } catch (error) {
     return NextResponse.json({ error: String(error) }, { status: 500 });
   }
