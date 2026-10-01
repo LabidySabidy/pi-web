@@ -12,10 +12,10 @@ import {
   createProjectCommandBashOperations,
   preferUserBashExtension,
 } from "./project-command-env";
-import { cacheSessionPath, invalidateSessionListCache, resolveSessionPath } from "./session-reader";
+import { cacheSessionPath, getLatestModelChange, invalidateSessionListCache, readLatestSessionEntryId, resolveSessionPath } from "./session-reader";
 import { getProjectTrustStatus, projectTrustReloadOptions } from "./project-trust";
-import { persistExplicitStartupPreferences } from "./startup-preferences";
 import { notifySessionComplete } from "./web-push";
+import { hasActiveSessionLivenessProvider } from "./session-liveness";
 import type { SlashCommandInfo } from "@earendil-works/pi-coding-agent";
 import type { AgentSessionLike, ExtensionUiContextLike, ToolInfo } from "./pi-types";
 import type {
@@ -39,8 +39,11 @@ import {
 } from "./subagents";
 import { createSubagentController } from "./subagent-runtime";
 import { isBuiltInSubagentsEnabled } from "./subagent-settings";
+import { resolveShellTools } from "./powershell-settings";
 import { CHAT_ONLY_RESOURCE_LOADER_OPTIONS, contextFilesSystemPrompt } from "./chat-only";
+import { createExactSystemPromptExtension } from "./exact-system-prompt";
 import {
+  appendClearedSessionToolSelection,
   appendSessionToolSelection,
   readSessionToolSelection,
   validateSessionToolSelection,
@@ -115,22 +118,35 @@ type AgentSessionWrapperOptions = {
   suppressCompletionNotifications?: boolean;
 };
 
-const RUNNING_STATE_EVENT_TYPES = new Set([
-  "agent_start",
-  "agent_end",
-  "agent_settled",
-  "auto_compaction_start",
-  "auto_compaction_end",
-  "compaction_start",
-  "compaction_end",
-]);
-
 const IDLE_RESET_EVENT_TYPES = new Set([
   "agent_end",
   "agent_settled",
   "auto_compaction_end",
   "compaction_end",
 ]);
+
+const DEFAULT_SESSION_IDLE_TIMEOUT_MS = 10 * 60 * 1000;
+
+/**
+ * Resolves the PI_WEB_IDLE_TIMEOUT_MS environment variable into a session idle
+ * timeout in milliseconds. An unset/blank value returns the 10-minute default,
+ * `0` disables idle shutdown, and positive values up to Node's timer limit
+ * (2147483647 ms) are used as-is. Invalid or out-of-range values fall back to
+ * the default with a console warning.
+ * @param rawValue Value to parse; defaults to the environment variable.
+ */
+export function resolveSessionIdleTimeoutMs(
+  rawValue: string | undefined = process.env.PI_WEB_IDLE_TIMEOUT_MS,
+): number {
+  if (rawValue !== undefined && rawValue.trim() !== "") {
+    const parsed = Number(rawValue);
+    if (Number.isFinite(parsed) && parsed >= 0 && parsed <= 2_147_483_647) return parsed;
+    console.warn(`[pi-web] invalid PI_WEB_IDLE_TIMEOUT_MS "${rawValue}", falling back to 10 minutes`);
+  }
+  return DEFAULT_SESSION_IDLE_TIMEOUT_MS;
+}
+
+const SESSION_IDLE_TIMEOUT_MS = resolveSessionIdleTimeoutMs();
 
 const SESSION_REPLACEMENT_COMMAND_TYPES = new Set(["fork", "clone"]);
 const COMMANDS_ALLOWED_DURING_SESSION_REPLACEMENT = new Set([
@@ -150,14 +166,14 @@ export interface RpcSessionStartOptions {
   thinkingLevel?: ThinkingLevel;
 }
 
-const CODING_TOOL_NAMES = ["read", "bash", "edit", "write", "grep", "find", "ls"];
+const CODING_TOOL_NAMES = ["read", "bash", "powershell", "edit", "write", "grep", "find", "ls"];
 const THINKING_LEVEL_NAMES = new Set<ThinkingLevel>(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
 
 // Extensions require a complete Theme, while the web UI applies its own styling.
 class PlainTextTheme extends Theme {
   constructor() {
     super(
-      { thinkingXhigh: "", searchMatchText: "" } as ConstructorParameters<typeof Theme>[0],
+      { muted: "", text: "", thinkingXhigh: "", searchMatchText: "" } as ConstructorParameters<typeof Theme>[0],
       { selectedBg: "" } as ConstructorParameters<typeof Theme>[1],
       "truecolor",
     );
@@ -181,16 +197,21 @@ class PlainTextTheme extends Theme {
 const PLAIN_TEXT_THEME = new PlainTextTheme();
 const CUSTOM_UI_KEYBINDINGS = new TuiKeybindingsManager(TUI_KEYBINDINGS);
 
+// pi activates `direct` and `model-only` tools when they are registered. `codemode` and
+// `deferred` tools stay undeclared until something activates them, and `hidden` is withdrawn.
+const ACTIVE_ON_REGISTRATION_EXPOSURES = new Set(["direct", "model-only"]);
+
 function withExtensionTools(session: AgentSessionLike, toolNames: string[]): string[] {
   if (toolNames.length === 0) return [];
 
   const codingToolNames = new Set(CODING_TOOL_NAMES);
+  const selectedToolNames = resolveShellTools(toolNames, session.settingsManager.getDefaultTools());
   const extensionToolNames = session
     .getAllTools()
-    .map((t) => t.name)
-    .filter((name) => !codingToolNames.has(name));
+    .filter((t) => !codingToolNames.has(t.name) && ACTIVE_ON_REGISTRATION_EXPOSURES.has(t.exposure ?? "direct"))
+    .map((t) => t.name);
 
-  return [...new Set([...toolNames, ...extensionToolNames])];
+  return [...new Set([...selectedToolNames, ...extensionToolNames])];
 }
 
 // ============================================================================
@@ -199,10 +220,15 @@ function withExtensionTools(session: AgentSessionLike, toolNames: string[]): str
 // ============================================================================
 
 export class AgentSessionWrapper {
-  private listeners: EventListener[] = [];
+  // A Set, not an array: an SSE stream unsubscribes from inside emit() when it
+  // closes on session_shutdown, and splicing an array mid-iteration made the
+  // next stream miss that same event.
+  private listeners = new Set<EventListener>();
+  private activeToolEvents = new Map<string, AgentEvent>();
   private pendingUiResponses = new Map<string, PendingUiResponse>();
   private pendingUiRequests = new Map<string, AgentEvent>();
   private activeCustomUis = new Map<string, ActiveCustomUi>();
+  private extensionUiAbortController = new AbortController();
   private extensionStatuses = new Map<string, string>();
   private extensionWidgets = new Map<string, ExtensionWidgetItem>();
   private activeExtensionWidgets = new Map<string, ActiveExtensionWidget>();
@@ -226,6 +252,8 @@ export class AgentSessionWrapper {
   private shutdownPromise: Promise<void> | null = null;
   private sessionShutdownEmitted = false;
   private forceShutdownOnIdle = false;
+  // The armed idle timer is the forced cleanup Stop scheduled.
+  private forcedIdleTimerArmed = false;
   private _alive = true;
 
   // NOTE: a private `emitThinkingLevelAsserted` helper lived here. It re-emitted
@@ -246,8 +274,6 @@ export class AgentSessionWrapper {
     this.chatOnly = options.chatOnly ?? false;
     this.onAgentRunComplete = options.onAgentRunComplete;
     this.suppressCompletionNotifications = options.suppressCompletionNotifications ?? false;
-    this.installExactSystemPromptContinuation();
-    this.applyExactSystemPrompt();
   }
 
   get sessionId(): string {
@@ -278,6 +304,21 @@ export class AgentSessionWrapper {
     return this._alive && (this.pendingPromptCount > 0 || this.inner.isStreaming || this.inner.isCompacting || this.inner.isBashRunning);
   }
 
+  /**
+   * Drop this idle wrapper when the on-disk JSONL has an entry the in-memory
+   * index never saw (another pi process appended). Rechecks isRunning() so a
+   * prompt that started during the probe cannot be disposed.
+   */
+  evictIfDiskAhead(): boolean {
+    if (!this.isAlive() || this.isRunning()) return false;
+    const diskLatestId = readLatestSessionEntryId(this.sessionFile);
+    if (!diskLatestId || this.inner.sessionManager.getEntry(diskLatestId)) return false;
+    if (this.isRunning()) return false;
+    this.destroy();
+    invalidateSessionListCache();
+    return true;
+  }
+
   isChatOnly(): boolean {
     return this.chatOnly;
   }
@@ -292,13 +333,19 @@ export class AgentSessionWrapper {
       if (event.type === "agent_end") {
         invalidateSessionListCache();
       }
+      const toolCallId = event.toolCallId;
+      if (typeof toolCallId === "string") {
+        if (event.type === "tool_execution_start" || event.type === "tool_execution_update") {
+          this.activeToolEvents.set(toolCallId, event);
+        } else if (event.type === "tool_execution_end") {
+          this.activeToolEvents.delete(toolCallId);
+        }
+      }
       if (IDLE_RESET_EVENT_TYPES.has(event.type)) this.resetIdleTimer();
       this.emit(event);
-      if (RUNNING_STATE_EVENT_TYPES.has(event.type)) notifyRunningChange();
       if (event.type === "agent_settled") this.notifyAgentRunCompleteIfIdle();
     });
     this.resetIdleTimer();
-    notifyRunningChange();
   }
 
   private notifyAgentRunCompleteIfIdle(): void {
@@ -323,10 +370,7 @@ export class AgentSessionWrapper {
   }
 
   private ensureExtensionsBound(): Promise<void> {
-    if (this.extensionsBound) {
-      this.applyExactSystemPrompt();
-      return Promise.resolve();
-    }
+    if (this.extensionsBound) return Promise.resolve();
     if (this.extensionBindingPromise) return this.extensionBindingPromise;
 
     this.extensionBindingError = null;
@@ -363,7 +407,6 @@ export class AgentSessionWrapper {
         this.inner.extensionRunner.setUIContext?.(uiContext, "rpc");
       }
       this.extensionsBound = true;
-      this.applyExactSystemPrompt();
       console.log(`[pi-web] session_start dispatched to extensions for session ${this.inner.sessionId}`);
     })().catch((err) => {
       this.extensionBindingError = err;
@@ -394,38 +437,16 @@ export class AgentSessionWrapper {
       || type === "get_state";
   }
 
-  private async withFinalRunningNotification<T>(operation: () => Promise<T>): Promise<T> {
+  private async withFinalIdleReset<T>(operation: () => Promise<T>): Promise<T> {
     try {
       return await operation();
     } finally {
       this.resetIdleTimer();
-      notifyRunningChange();
     }
-  }
-
-  private applyExactSystemPrompt(): void {
-    if (!this.exactSystemPrompt || !this.inner.agent.state) return;
-    this.inner.agent.state.systemPrompt = this.exactSystemPrompt();
-  }
-
-  private installExactSystemPromptContinuation(): void {
-    if (!this.exactSystemPrompt) return;
-    const previous = this.inner.agent.prepareNextTurnWithContext;
-    this.inner.agent.prepareNextTurnWithContext = async (turn, signal) => {
-      const prepared = await previous?.(turn, signal);
-      return {
-        ...prepared,
-        context: {
-          ...(prepared?.context ?? turn.context),
-          systemPrompt: this.exactSystemPrompt!(),
-        },
-      };
-    };
   }
 
   setActiveToolSelection(toolNames: string[]): void {
     this.inner.setActiveToolsByName(withExtensionTools(this.inner, toolNames));
-    this.applyExactSystemPrompt();
   }
 
   private emit(event: AgentEvent): void {
@@ -452,18 +473,35 @@ export class AgentSessionWrapper {
   }
 
   private resetIdleTimer(): void {
-    if (this.idleTimer) clearTimeout(this.idleTimer);
-    if (!this._alive) return;
+    if (!this._alive) {
+      if (this.idleTimer) clearTimeout(this.idleTimer);
+      return;
+    }
     if (!this.isRunning()) this.forceShutdownOnIdle = false;
+    // A stuck user reloads, reopens the session or presses Stop again, and
+    // each of those commands lands here. Moving the forced deadline for them
+    // would keep a run that Stop cannot unwind alive indefinitely.
+    if (this.forceShutdownOnIdle && this.forcedIdleTimerArmed) return;
+    if (this.idleTimer) clearTimeout(this.idleTimer);
+    // A resolved timeout of 0 disables idle shutdown, but a run that Stop could
+    // not unwind is still reaped after the default delay; otherwise it stays
+    // running until the server restarts (#656).
+    const timeoutMs = SESSION_IDLE_TIMEOUT_MS
+      || (this.forceShutdownOnIdle ? DEFAULT_SESSION_IDLE_TIMEOUT_MS : 0);
+    this.forcedIdleTimerArmed = timeoutMs !== 0 && this.forceShutdownOnIdle;
+    if (timeoutMs === 0) return;
     this.idleTimer = setTimeout(() => {
-      if (this.isRunning() && !this.forceShutdownOnIdle) {
+      if (!this.forceShutdownOnIdle && (this.isRunning() || hasActiveSessionLivenessProvider({
+        sessionId: this.sessionId,
+        sessionFile: this.sessionFile || undefined,
+      }))) {
         this.resetIdleTimer();
         return;
       }
       void this.shutdown().catch((error) => {
         console.error("[pi-web] failed to shut down idle session:", error instanceof Error ? error.message : error);
       });
-    }, 10 * 60 * 1000);
+    }, timeoutMs);
   }
 
   private persistBashOnlySession(): void {
@@ -479,19 +517,19 @@ export class AgentSessionWrapper {
       .join("\n") + "\n";
     writeFileSync(sessionFile, content, { encoding: "utf8", flag: "wx" });
 
-    // Pi normally delays the first flush until an assistant message exists.
-    // A leading shell command has no assistant message, so mark this SDK
-    // manager as flushed after writing its own generated entries.
+    // Pi delays the first flush until a user or assistant message exists.
+    // A leading shell command is neither, so mark this SDK manager as
+    // flushed after writing its own generated entries.
     (manager as unknown as { flushed: boolean }).flushed = true;
     cacheSessionPath(this.inner.sessionId, sessionFile);
   }
 
   onEvent(listener: EventListener): () => void {
-    this.listeners.push(listener);
+    this.listeners.add(listener);
     for (const event of this.pendingUiRequests.values()) listener(event);
+    for (const event of this.activeToolEvents.values()) listener(event);
     return () => {
-      const i = this.listeners.indexOf(listener);
-      if (i !== -1) this.listeners.splice(i, 1);
+      this.listeners.delete(listener);
     };
   }
 
@@ -566,6 +604,9 @@ export class AgentSessionWrapper {
           if (this.inner.isBashRunning) {
             throw new Error("Cannot send a prompt while a shell command is running");
           }
+          if (this.extensionUiAbortController.signal.aborted) {
+            this.extensionUiAbortController = new AbortController();
+          }
           const promptImages = command.images as Array<{ type: "image"; data: string; mimeType: string }> | undefined;
           const streamingBehavior = command.streamingBehavior as "steer" | "followUp" | undefined;
           let preflightAccepted = false;
@@ -592,12 +633,10 @@ export class AgentSessionWrapper {
             promptSettled = true;
             this.pendingPromptCount = Math.max(0, this.pendingPromptCount - 1);
             this.resetIdleTimer();
-            notifyRunningChange();
             this.notifyAgentRunCompleteIfIdle();
           };
 
           this.pendingPromptCount += 1;
-          notifyRunningChange();
           let prompt: Promise<void>;
           try {
             prompt = this.inner.prompt(command.message as string, {
@@ -606,12 +645,9 @@ export class AgentSessionWrapper {
               source: "rpc",
               // Match pi's RPC contract: acknowledge only after synchronous prompt
               // validation and extension preflight have accepted the submission.
-              preflightResult: (success) => {
-                if (success) {
-                  this.applyExactSystemPrompt();
-                  acceptPreflight();
-                }
-              },
+              // Every disposition (handled, queued, started) is an acceptance; a
+              // rejected prompt never calls this and rejects `prompt` instead.
+              preflightResult: () => acceptPreflight(),
             });
           } catch (error) {
             finishPrompt();
@@ -653,8 +689,13 @@ export class AgentSessionWrapper {
 
       case "abort":
         this.forceShutdownOnIdle = true;
+        // Arm the forced cleanup now: the reset above ran before this flag,
+        // and the final reset only runs once the SDK run has unwound.
+        this.resetIdleTimer();
+        // Stop must unwind extension commands that have not started the agent yet.
+        this.extensionUiAbortController.abort(new DOMException("Extension UI cancelled by Stop", "AbortError"));
         try {
-          await this.withFinalRunningNotification(() => this.inner.abort());
+          await this.withFinalIdleReset(() => this.inner.abort());
           return null;
         } finally {
           if (!this.isRunning()) this.forceShutdownOnIdle = false;
@@ -682,7 +723,14 @@ export class AgentSessionWrapper {
           contextUsage: contextUsage
             ? { percent: contextUsage.percent, contextWindow: contextUsage.contextWindow, tokens: contextUsage.tokens }
             : null,
-          systemPrompt: this.inner.agent.state?.systemPrompt ?? "",
+          // An exact prompt is projected onto each run by the inline extension. Every other
+          // session reports `agent.state.systemPrompt`, which replays the transcript: that is
+          // what the model actually saw, including sections a `before_agent_start` handler
+          // changed for the run. It stays empty until the first run persists a system message,
+          // so a session that has not sent anything yet falls back to the session getter, which
+          // renders the prompt from the current options. The getter alone would drop those
+          // per-run changes again once the run ends.
+          systemPrompt: this.exactSystemPrompt?.() ?? (this.inner.agent.state?.systemPrompt || this.inner.systemPrompt || ""),
           thinkingLevel: this.inner.agent.state?.thinkingLevel ?? "off",
           extensionStatuses: this.getExtensionStatuses(),
           extensionWidgets: this.getExtensionWidgets(),
@@ -720,26 +768,59 @@ export class AgentSessionWrapper {
 
           const sessionDir = sessionManager.getSessionDir();
           let newSessionFile: string;
+          let forkedManager: SessionManager;
 
           if (!entry.parentId) {
             // Fork before the first message: create an empty session linked to this one
-            const newManager = SessionManager.create(sessionManager.getCwd(), sessionDir);
-            newManager.newSession({ parentSession: currentSessionFile });
-            newSessionFile = newManager.getSessionFile() as string;
+            forkedManager = SessionManager.create(sessionManager.getCwd(), sessionDir, {
+              parentSession: currentSessionFile,
+            });
+            newSessionFile = forkedManager.getSessionFile() as string;
           } else {
             // Fork after some history: copy path up to (but not including) the fork point
-            const sourceManager = SessionManager.open(currentSessionFile, sessionDir);
-            const forkedPath = sourceManager.createBranchedSession(entry.parentId);
+            forkedManager = SessionManager.open(currentSessionFile, sessionDir);
+            const forkedPath = forkedManager.createBranchedSession(entry.parentId);
             if (!forkedPath) throw new Error("Failed to create forked session");
             newSessionFile = forkedPath;
           }
 
-          const newSessionId = SessionManager.open(newSessionFile, sessionDir).getSessionId();
+          if (!existsSync(newSessionFile)) {
+            const header = forkedManager.getHeader();
+            if (!header) throw new Error("Forked session is missing a session header");
+            const content = [header, ...forkedManager.getEntries()]
+              .map((forkedEntry) => JSON.stringify(forkedEntry))
+              .join("\n") + "\n";
+            writeFileSync(newSessionFile, content, { encoding: "utf8", flag: "wx" });
+          }
+
+          const newSessionId = forkedManager.getSessionId();
           cacheSessionPath(newSessionId, newSessionFile);
           invalidateSessionListCache();
           await this.shutdownAfterSessionReplacement("fork");
           return { cancelled: false, newSessionId };
         });
+      }
+
+      case "fork_branch": {
+        if (this.isSessionRunningForReplacement()) {
+          throw new Error("Cannot fork while the session is running");
+        }
+        const entryId = command.entryId as string;
+        const sessionManager = this.inner.sessionManager;
+        const currentSessionFile = this.inner.sessionFile;
+        if (!sessionManager.isPersisted()) return { cancelled: true };
+        if (!currentSessionFile) throw new Error("Persisted session is missing a session file");
+        if (!sessionManager.getEntry(entryId)) throw new Error("Invalid entry ID for forking");
+
+        const sessionDir = sessionManager.getSessionDir();
+        const sourceManager = SessionManager.open(currentSessionFile, sessionDir);
+        const forkedPath = sourceManager.createBranchedSession(entryId);
+        if (!forkedPath) throw new Error("Failed to create forked session");
+
+        const newSessionId = SessionManager.open(forkedPath, sessionDir).getSessionId();
+        cacheSessionPath(newSessionId, forkedPath);
+        invalidateSessionListCache();
+        return { cancelled: false, newSessionId };
       }
 
       case "clone": {
@@ -807,7 +888,7 @@ export class AgentSessionWrapper {
 
       case "compact": {
         try {
-          return await this.withFinalRunningNotification(() =>
+          return await this.withFinalIdleReset(() =>
             this.inner.compact(command.customInstructions as string | undefined)
           );
         } finally {
@@ -858,7 +939,8 @@ export class AgentSessionWrapper {
       }
 
       case "get_tools": {
-        const all: ToolInfo[] = this.inner.getAllTools();
+        // A hidden tool is withdrawn: pi ignores it when setting the active tools.
+        const all: ToolInfo[] = this.inner.getAllTools().filter((t) => t.exposure !== "hidden");
         const active = new Set<string>(this.inner.getActiveToolNames());
         return all.map((t) => ({
           ...t,
@@ -902,15 +984,19 @@ export class AgentSessionWrapper {
       }
 
       case "reload": {
+        if (this.extensionUiAbortController.signal.aborted) {
+          this.extensionUiAbortController = new AbortController();
+        }
+        const activeToolNames = this.inner.getActiveToolNames();
         await this.waitForExtensionsBound();
         this.extensionStatuses.clear();
         this.resetExtensionWidgetsForReload();
         this.syncProjectTrust();
         await this.inner.reload();
+        this.setActiveToolSelection(activeToolNames);
         if (typeof this.inner.bindExtensions !== "function") {
           this.inner.extensionRunner.setUIContext?.(this.createExtensionUiContext(), "rpc");
         }
-        this.applyExactSystemPrompt();
         invalidateModelsCache();
         return { success: true };
       }
@@ -949,7 +1035,6 @@ export class AgentSessionWrapper {
             }),
           },
         );
-        notifyRunningChange();
         try {
           const result = await execution;
           this.persistBashOnlySession();
@@ -957,12 +1042,12 @@ export class AgentSessionWrapper {
         } finally {
           this.resetIdleTimer();
           invalidateSessionListCache();
-          notifyRunningChange();
         }
       }
 
       case "abort_bash": {
         this.forceShutdownOnIdle = true;
+        this.resetIdleTimer();
         this.inner.abortBash();
         return null;
       }
@@ -978,6 +1063,9 @@ export class AgentSessionWrapper {
   destroy(): void {
     if (!this._alive) return;
     this._alive = false;
+    // Tell attached SSE listeners to drop this instance so the browser
+    // EventSource errors and reconnects instead of staying OPEN on a dead wrapper.
+    this.emit({ type: "session_shutdown" });
     if (this.idleTimer) clearTimeout(this.idleTimer);
     if (this.inner.isBashRunning) this.inner.abortBash();
     this.unsubscribe?.();
@@ -985,17 +1073,14 @@ export class AgentSessionWrapper {
     for (const id of Array.from(this.activeCustomUis.keys())) this.closeCustomUi(id, undefined);
     this.pendingUiResponses.clear();
     this.pendingUiRequests.clear();
+    this.activeToolEvents.clear();
     this.clearExtensionWidgets(false);
 
     const finishDispose = () => {
       try {
         this.inner.dispose();
       } finally {
-        try {
-          this.onDestroyCallback?.();
-        } finally {
-          notifyRunningChange();
-        }
+        this.onDestroyCallback?.();
       }
     };
 
@@ -1333,10 +1418,13 @@ export class AgentSessionWrapper {
   ): Promise<T> {
     if (typeof factory !== "function") return Promise.resolve(undefined as T);
 
+    const stopSignal = this.extensionUiAbortController.signal;
+    if (stopSignal.aborted) return Promise.reject(stopSignal.reason);
+
     const id = randomUUID();
     const width = this.getCustomUiWidth(options);
 
-    return new Promise<T>((resolve) => {
+    return new Promise<T>((resolve, reject) => {
       let completed = false;
       const tui = createHeadlessCustomUiTui(
         () => {
@@ -1348,7 +1436,9 @@ export class AgentSessionWrapper {
       const finish = (value: T) => {
         if (completed) return;
         completed = true;
-        resolve(value);
+        stopSignal.removeEventListener("abort", onStop);
+        if (stopSignal.aborted) reject(stopSignal.reason);
+        else resolve(value);
       };
       const done = (value: T) => {
         if (this.activeCustomUis.has(id)) {
@@ -1357,9 +1447,11 @@ export class AgentSessionWrapper {
           finish(value);
         }
       };
+      const onStop = () => done(undefined as T);
+      stopSignal.addEventListener("abort", onStop, { once: true });
 
       Promise.resolve()
-        .then(() => factory(tui, PLAIN_TEXT_THEME, CUSTOM_UI_KEYBINDINGS, done))
+        .then(() => completed ? undefined : factory(tui, PLAIN_TEXT_THEME, CUSTOM_UI_KEYBINDINGS, done))
         .then((component) => {
           if (completed) {
             try {
@@ -1403,6 +1495,9 @@ export class AgentSessionWrapper {
     signal?: AbortSignal,
   ): Promise<T> {
     if (signal?.aborted) return Promise.resolve(defaultValue);
+    const stopSignal = this.extensionUiAbortController.signal;
+    if (stopSignal.aborted) return Promise.reject(stopSignal.reason);
+    const abortSignal = signal ? AbortSignal.any([signal, stopSignal]) : stopSignal;
 
     const id = randomUUID();
     const fullRequest = {
@@ -1412,22 +1507,27 @@ export class AgentSessionWrapper {
       ...(timeout ? { timeout, expiresAt: Date.now() + timeout } : {}),
     };
 
-    return new Promise((resolve) => {
+    return new Promise((resolve, reject) => {
+      let settled = false;
       let timeoutId: ReturnType<typeof setTimeout> | undefined;
       const cleanup = () => {
         if (timeoutId) clearTimeout(timeoutId);
-        signal?.removeEventListener("abort", onAbort);
+        abortSignal.removeEventListener("abort", onAbort);
         this.pendingUiRequests.delete(id);
         this.pendingUiResponses.delete(id);
+        this.emit({ type: "extension_ui_closed", id });
       };
       const settle = (value: T) => {
+        if (settled) return;
+        settled = true;
         cleanup();
-        resolve(value);
+        if (stopSignal.aborted) reject(stopSignal.reason);
+        else resolve(value);
       };
       const onAbort = () => settle(defaultValue);
 
       if (timeout) timeoutId = setTimeout(() => settle(defaultValue), timeout);
-      signal?.addEventListener("abort", onAbort, { once: true });
+      abortSignal.addEventListener("abort", onAbort, { once: true });
 
       this.pendingUiRequests.set(id, fullRequest as AgentEvent);
       this.pendingUiResponses.set(id, {
@@ -1588,7 +1688,6 @@ export class AgentSessionWrapper {
             this.inner.extensionRunner.setUIContext?.(this.createExtensionUiContext(), "rpc");
           },
         });
-        this.applyExactSystemPrompt();
       },
     };
   }
@@ -1607,7 +1706,6 @@ declare global {
   var __piSessions: Map<string, AgentSessionWrapper> | undefined;
   var __piStartLocks: Map<string, Promise<{ session: AgentSessionWrapper; realSessionId: string }>> | undefined;
   var __piStartingSessionCwds: Map<string, number> | undefined;
-  var __piRunningListeners: Set<(ids: string[]) => void> | undefined;
 }
 
 function getRegistry(): Map<string, AgentSessionWrapper> {
@@ -1653,7 +1751,6 @@ const SUBAGENT_CONTROLLER = createSubagentController({
     (await startRpcSession(sessionId, sessionFile, undefined)).session,
   resolveSessionPath,
   invalidateSessionList: invalidateSessionListCache,
-  notifyRunningChange,
   isBuiltInSubagentsEnabled,
 });
 
@@ -1709,13 +1806,20 @@ export interface SetRpcSessionToolsResult {
   recreated: boolean;
 }
 
-/** Persist a normal session's tool selection and rebuild when resource policy changes. */
+/**
+ * Persist a normal session's tool selection and rebuild when resource policy changes.
+ * An undefined requestedToolNames returns the session to pi's configured defaults:
+ * the pin is retracted and the session is rebuilt, because the loadout that
+ * settings.json defaultTools resolves to is only known once pi builds the session.
+ */
 export async function setRpcSessionTools(
   sessionId: string,
   sessionFile: string | undefined,
   requestedToolNames: unknown,
 ): Promise<SetRpcSessionToolsResult> {
-  const toolNames = validateSessionToolSelection(requestedToolNames);
+  const toolNames = requestedToolNames === undefined
+    ? undefined
+    : validateSessionToolSelection(requestedToolNames);
   const existing = getRpcSession(sessionId);
 
   if (!existing?.isAlive()) {
@@ -1724,7 +1828,8 @@ export async function setRpcSessionTools(
     if (readSubagentSessionResources(manager.getEntries() as unknown as SessionEntry[])) {
       throw new Error("Subagent tool selection is fixed by its profile");
     }
-    appendSessionToolSelection(manager, toolNames);
+    if (toolNames === undefined) appendClearedSessionToolSelection(manager);
+    else appendSessionToolSelection(manager, toolNames);
     invalidateSessionListCache();
     const started = await startRpcSession(sessionId, sessionFile, undefined);
     return { session: started.session, sessionId: started.realSessionId, recreated: false };
@@ -1737,12 +1842,14 @@ export async function setRpcSessionTools(
 
   const hasCurrentResourcePolicy = typeof existing.isChatOnly === "function"
     && typeof existing.setActiveToolSelection === "function";
-  const crossesChatOnlyBoundary = !hasCurrentResourcePolicy
+  const crossesChatOnlyBoundary = toolNames === undefined
+    || !hasCurrentResourcePolicy
     || existing.isChatOnly() !== (toolNames.length === 0);
-  appendSessionToolSelection(existing.inner.sessionManager, toolNames);
+  if (toolNames === undefined) appendClearedSessionToolSelection(existing.inner.sessionManager);
+  else appendSessionToolSelection(existing.inner.sessionManager, toolNames);
   invalidateSessionListCache();
 
-  if (!crossesChatOnlyBoundary) {
+  if (toolNames !== undefined && !crossesChatOnlyBoundary) {
     existing.setActiveToolSelection(toolNames);
     return { session: existing, sessionId, recreated: false };
   }
@@ -1761,7 +1868,7 @@ export async function setRpcSessionTools(
   }
 
   const started = await startRpcSession(`__recreate__${randomUUID()}`, "", sessionCwd, {
-    toolNames,
+    ...(toolNames !== undefined ? { toolNames } : {}),
     ...(model ? { initialModel: { provider: model.provider, modelId: model.id } } : {}),
     allowInitialModelFallback: true,
     ...(currentThinkingLevel && THINKING_LEVEL_NAMES.has(currentThinkingLevel as ThinkingLevel)
@@ -1793,12 +1900,13 @@ function runtimeMessageActivityMs(entry: SessionMessageEntry): number | undefine
  * the first JSONL flush until an assistant message exists, so an accepted new
  * prompt must temporarily be described from its in-memory SessionManager.
  */
-export function getRpcSessionInfos(): SessionInfo[] {
+export function getRpcSessionInfos(options: { includeTransient?: boolean } = {}): SessionInfo[] {
   const sessions: SessionInfo[] = [];
   for (const session of getRegistry().values()) {
-    if (!session.isAlive()) continue;
+    if (typeof session.isAlive !== "function" || !session.isAlive()) continue;
 
-    const manager = session.inner.sessionManager;
+    const manager = session.inner?.sessionManager;
+    if (!manager) continue;
     const header = manager.getHeader();
     const entries = manager.getEntries() as unknown as Array<
       { type: string; timestamp: string } | SessionMessageEntry
@@ -1811,7 +1919,7 @@ export function getRpcSessionInfos(): SessionInfo[] {
 
     // An ensure_session call creates an idle, empty runtime while the composer
     // loads commands. Do not leak it into history before a prompt is accepted.
-    if (!persisted && (!session.isRunning() || !firstUserMessage)) continue;
+    if (!persisted && !options.includeTransient && (!session.isRunning() || !firstUserMessage)) continue;
 
     const created = header?.timestamp
       ?? entries[0]?.timestamp
@@ -1881,50 +1989,6 @@ export function getCompletionNotificationSuppressedRpcSessionIds(): string[] {
     }
   }
   return [...ids];
-}
-
-// ----------------------------------------------------------------------------
-// Running-status broadcaster
-//
-// Pushes the current set of running session ids to subscribers whenever any
-// session's running state may have changed. This lets the sidebar receive live
-// updates over SSE instead of polling. Listeners live on globalThis so they
-// survive Next.js hot-reload.
-// ----------------------------------------------------------------------------
-
-function getRunningListeners(): Set<(ids: string[]) => void> {
-  if (!globalThis.__piRunningListeners) globalThis.__piRunningListeners = new Set();
-  return globalThis.__piRunningListeners;
-}
-
-/** Subscribe to running-session-id changes. Returns an unsubscribe function. */
-export function subscribeRunningSessions(listener: (ids: string[]) => void): () => void {
-  const listeners = getRunningListeners();
-  listeners.add(listener);
-  return () => { listeners.delete(listener); };
-}
-
-let lastRunningSnapshot = "";
-
-/**
- * Recompute the running-session-id set and, if it changed since the last
- * notification, broadcast it to subscribers.
- */
-export function notifyRunningChange(): void {
-  const listeners = getRunningListeners();
-  if (listeners.size === 0) {
-    // A future subscriber receives its own initial snapshot. Clear this one so
-    // its first state transition cannot match stale state from an old listener.
-    lastRunningSnapshot = "";
-    return;
-  }
-  const ids = getRunningRpcSessionIds();
-  const snapshot = JSON.stringify([...ids].sort());
-  if (snapshot === lastRunningSnapshot) return;
-  lastRunningSnapshot = snapshot;
-  for (const listener of listeners) {
-    try { listener(ids); } catch { /* ignore listener errors */ }
-  }
 }
 
 /**
@@ -2009,6 +2073,13 @@ export async function startRpcSession(
         ? undefined
         : projectTrustReloadOptions(sessionCwd, agentDir);
     const settingsManager = SettingsManager.create(sessionCwd, agentDir);
+    // Chat-only sessions and subagents that replace Pi's prompt send an exact
+    // system prompt. The prompt is resolved at prompt time through this inline
+    // extension: it may read the session's context files, which exist only
+    // after the session is created, so the getter is filled in below.
+    const exactSystemPromptRef: { current?: () => string } = {};
+    const exactSystemPromptExtension = createExactSystemPromptExtension(() => exactSystemPromptRef.current?.());
+    const usesExactSystemPrompt = chatOnly || subagentResources?.exactSystemPrompt !== undefined;
     const services = await createAgentSessionServices({
       cwd: sessionCwd,
       agentDir,
@@ -2027,9 +2098,10 @@ export async function startRpcSession(
                 }
               : {}),
             appendSystemPrompt: subagentResources.appendSystemPrompt,
+            ...(usesExactSystemPrompt ? { extensionFactories: [exactSystemPromptExtension] } : {}),
           }
         : chatOnly
-          ? CHAT_ONLY_RESOURCE_LOADER_OPTIONS
+          ? { ...CHAT_ONLY_RESOURCE_LOADER_OPTIONS, extensionFactories: [exactSystemPromptExtension] }
         : {
             extensionFactories: [
               createProjectCommandBashExtension({
@@ -2058,67 +2130,51 @@ export async function startRpcSession(
       : undefined;
     const defaultProvider = services.settingsManager.getDefaultProvider();
     const defaultModelId = services.settingsManager.getDefaultModel();
-    const hasExistingMessages = sessionManager.getBranch().some((entry) => entry.type === "message");
-    const initial = hasExistingMessages
-      ? { scopedModels: [...scope.scopedModels] }
-      : selectInitialModelScope(scope, {
+    const branch = sessionManager.getBranch();
+    // System messages carry the prompt and tool loadout, not a conversation.
+    const hasExistingMessages = branch.some((entry) => entry.type === "message" && entry.message.role !== "system");
+    const savedModel = hasExistingMessages
+      ? getLatestModelChange(branch as unknown as SessionEntry[])
+      : null;
+    const restoredModel = savedModel
+      ? services.modelRuntime.getModel(savedModel.provider, savedModel.modelId)
+      : undefined;
+    const initial = hasExistingMessages ? null : selectInitialModelScope(scope, {
         ...(effectiveInitialModel ? { requestedModel: effectiveInitialModel } : {}),
         ...(defaultProvider && defaultModelId
           ? { defaultModel: { provider: defaultProvider, modelId: defaultModelId } }
           : {}),
         ...(thinkingLevel ? { thinkingLevel } : {}),
       });
+    const startupModel = restoredModel && services.modelRuntime.hasConfiguredAuth(restoredModel.provider)
+      ? restoredModel
+      : initial?.model;
     const { session: inner } = await createAgentSessionFromServices({
       services,
       sessionManager,
-      ...(initial.model ? { model: initial.model } : {}),
-      ...(initial.thinkingLevel ? { thinkingLevel: initial.thinkingLevel } : {}),
-      ...(initial.scopedModels.length > 0 ? { scopedModels: initial.scopedModels } : {}),
+      ...(startupModel ? { model: startupModel } : {}),
+      ...(initial?.thinkingLevel ? { thinkingLevel: initial.thinkingLevel } : {}),
+      ...(scope.scopedModels.length > 0 ? { scopedModels: [...scope.scopedModels] } : {}),
       ...(toolsOption !== undefined ? { tools: toolsOption } : {}),
       ...(subagentResources ? { excludeTools: [...SUBAGENT_CONTROL_TOOL_NAMES] } : {}),
     });
 
-    const persistedPreferences = await persistExplicitStartupPreferences(
-      services.settingsManager,
-      {
-        ...(effectiveInitialModel ? { model: effectiveInitialModel } : {}),
-        ...(thinkingLevel ? { thinkingLevel } : {}),
-      },
-      {
-        ...(inner.model
-          ? { model: { provider: inner.model.provider, modelId: inner.model.id } }
-          : {}),
-        thinkingLevel: inner.thinkingLevel,
-        supportsThinking: inner.supportsThinking(),
-      },
-    );
-    if (persistedPreferences.modelDefaultChanged) invalidateModelsCache();
-    if (persistedPreferences.thinkingLevelDiverged) {
-      // The browser asked for a thinking level the session did not end up with, so nothing was
-      // written. That is deliberate (GL-033: the old code wrote the session's LIVE level instead, which
-      // could persist a transient value as the global default) — but it is worth knowing about, because
-      // a silent refusal and a silent wrong write look identical in a log that says nothing at all.
-      console.warn(
-        "[pi-web] requested thinking level",
-        thinkingLevel,
-        "but the session resolved",
-        inner.thinkingLevel,
-        "— not persisting a default (GL-033)",
-      );
-    }
 
     // If specific tool names were requested (non-empty), set the active tools to the
     // requested builtin coding tools PLUS all extension/package tools, so installed
     // extensions stay usable in Pi Web just like in the `pi` CLI.
-    if (!subagentResources && selectedToolNames && selectedToolNames.length > 0) {
-      inner.setActiveToolsByName(withExtensionTools(inner, selectedToolNames));
+    if (!subagentResources && !chatOnly) {
+      inner.setActiveToolsByName(withExtensionTools(inner, selectedToolNames ?? inner.getActiveToolNames()));
     }
 
-    const exactSystemPrompt = chatOnly
-      ? subagentResources
-        ? () => subagentResources.appendSystemPrompt[0] ?? ""
-        : () => contextFilesSystemPrompt(inner.resourceLoader.getAgentsFiles().agentsFiles)
-      : undefined;
+    const exactSystemPrompt = subagentResources?.exactSystemPrompt !== undefined
+      ? () => subagentResources.exactSystemPrompt!
+      : chatOnly
+        ? subagentResources
+          ? () => subagentResources.appendSystemPrompt[0] ?? ""
+          : () => contextFilesSystemPrompt(inner.resourceLoader.getAgentsFiles().agentsFiles)
+        : undefined;
+    exactSystemPromptRef.current = exactSystemPrompt;
     const wrapper = new AgentSessionWrapper(inner, {
       exactSystemPrompt,
       chatOnly,

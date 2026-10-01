@@ -9,6 +9,11 @@ const PRECACHE_URLS = [
   "/icons/icon-512.png",
   "/icons/apple-touch-icon.png",
 ];
+// A reachable port backed by a dead upstream accepts the connection and then
+// never answers: fetch() neither resolves nor rejects, so the navigation hangs
+// forever instead of falling back to offline.html. Bound every network wait.
+const NAVIGATION_TIMEOUT_MS = 8000;
+const ASSET_TIMEOUT_MS = 8000;
 
 self.addEventListener("install", (event) => {
   event.waitUntil(
@@ -46,7 +51,7 @@ self.addEventListener("fetch", (event) => {
 
   if (request.mode === "navigate") {
     event.respondWith(
-      fetch(request).catch(async () => {
+      fetchWithTimeout(request, NAVIGATION_TIMEOUT_MS).catch(async () => {
         const fallback = await caches.match(OFFLINE_URL);
         return fallback ?? Response.error();
       }),
@@ -73,17 +78,17 @@ self.addEventListener("push", (event) => {
   const { title, body, url, tag } = payload;
   if (typeof title !== "string" || !title || typeof body !== "string" || !body) return;
 
-  // The in-page notification path handles the visible case (and plays the
-  // completion sound). Only surface a system notification when no window for
-  // this app is visible — e.g. a backgrounded iOS PWA.
+  // Always surface a system notification. iOS revokes the push subscription
+  // when a service worker handles a push without showing a notification, so
+  // suppressing the notification while a window is visible poisons the
+  // subscription in the background-delivery case. Notifications sharing a tag
+  // replace each other instead of stacking, so a visible window merely sees
+  // the completion notification re-appear.
   event.waitUntil(
-    self.clients.matchAll({ type: "window", includeUncontrolled: true }).then((clients) => {
-      if (clients.some((client) => client.visibilityState === "visible")) return;
-      return self.registration.showNotification(title, {
-        body,
-        data: { url: typeof url === "string" && url ? url : "/" },
-        ...(typeof tag === "string" && tag ? { tag } : {}),
-      });
+    self.registration.showNotification(title, {
+      body,
+      data: { url: typeof url === "string" && url ? url : "/" },
+      ...(typeof tag === "string" && tag ? { tag, renotify: true } : {}),
     }),
   );
 });
@@ -130,11 +135,27 @@ async function focusOrOpenWindow(targetUrl) {
   await self.clients.openWindow(targetUrl);
 }
 
+/**
+ * Fetch with a ceiling on the wait for the response headers (time to first
+ * byte). The timer is cleared as soon as they arrive, so a response that
+ * streams a long body — Next.js streams SSR output — is never cut off
+ * mid-stream.
+ */
+async function fetchWithTimeout(request, timeoutMs) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(request, { signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function cacheFirst(request) {
   const cached = await caches.match(request);
   if (cached) return cached;
 
-  const response = await fetch(request);
+  const response = await fetchWithTimeout(request, ASSET_TIMEOUT_MS);
   if (response.ok && response.type === "basic") {
     const cache = await caches.open(STATIC_CACHE);
     await cache.put(request, response.clone());

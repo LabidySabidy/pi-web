@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import test from "node:test";
+import test, { mock } from "node:test";
 
 const listeners = new Map();
 globalThis.self = {
@@ -43,7 +43,7 @@ function dispatchPush(payload, clients) {
   return { pending, shown };
 }
 
-test("push shows a notification when no window is visible", async () => {
+test("push always shows a notification, even when a window is visible", async () => {
   const event = dispatchPush(
     {
       title: "Session complete",
@@ -51,23 +51,6 @@ test("push shows a notification when no window is visible", async () => {
       url: "/?session=session-1",
       tag: "pi-session-complete:session-1",
     },
-    [{ url: "https://pi.test/?session=other", visibilityState: "hidden" }],
-  );
-  await event.pending;
-
-  assert.deepEqual(event.shown, [{
-    title: "Session complete",
-    options: {
-      body: "Task finished.",
-      data: { url: "/?session=session-1" },
-      tag: "pi-session-complete:session-1",
-    },
-  }]);
-});
-
-test("push skips the system notification when a window is visible", async () => {
-  const event = dispatchPush(
-    { title: "Session complete", body: "Task finished.", url: "/?session=session-1" },
     [
       { url: "https://pi.test/?session=other", visibilityState: "hidden" },
       { url: "https://pi.test/?session=session-1", visibilityState: "visible" },
@@ -75,7 +58,17 @@ test("push skips the system notification when a window is visible", async () => 
   );
   await event.pending;
 
-  assert.deepEqual(event.shown, []);
+  // iOS revokes the push subscription when a push is handled without a
+  // notification, so the notification must never be suppressed.
+  assert.deepEqual(event.shown, [{
+    title: "Session complete",
+    options: {
+      body: "Task finished.",
+      data: { url: "/?session=session-1" },
+      tag: "pi-session-complete:session-1",
+      renotify: true,
+    },
+  }]);
 });
 
 test("push ignores malformed payloads", async () => {
@@ -145,4 +138,110 @@ test("notification click opens a window and rejects cross-origin targets", async
   await event.pending;
 
   assert.deepEqual(opened, ["https://pi.test/"]);
+});
+
+// A reachable port backed by a dead upstream answers nothing at all, so these
+// tests drive fetch() with a stub that only settles once the worker aborts it.
+function installOfflineStub() {
+  const offline = new Response("<!doctype html><title>Pi Web is offline</title>", {
+    status: 200,
+    headers: { "Content-Type": "text/html" },
+  });
+  globalThis.caches = {
+    match: async (request) => ((typeof request === "string" ? request : request.url).endsWith("/offline.html")
+      ? offline
+      : undefined),
+    open: async () => ({ put: async () => {} }),
+  };
+}
+
+function dispatchFetch(url, { mode = "cors", method = "GET" } = {}) {
+  let pending;
+  const request = new Request(url, { method });
+  Object.defineProperty(request, "mode", { value: mode });
+  listeners.get("fetch")({
+    request,
+    respondWith: (promise) => { pending = promise; },
+  });
+  return pending;
+}
+
+/** fetch() that never settles until the signal it was handed is aborted. */
+function installHungNetwork() {
+  let aborted = false;
+  globalThis.fetch = (_request, init) =>
+    new Promise((_resolve, reject) => {
+      init.signal.addEventListener("abort", () => {
+        aborted = true;
+        reject(new DOMException("The operation was aborted.", "AbortError"));
+      });
+    });
+  return () => aborted;
+}
+
+/**
+ * Let a handler's await chain reach its fetch (and schedule its timer) before
+ * the fake clock is ticked. setImmediate is not faked, unlike setTimeout.
+ */
+const flushMicrotasks = () => new Promise((resolve) => setImmediate(resolve));
+
+test("a stalled navigation falls back to offline.html", async () => {
+  installOfflineStub();
+  const wasAborted = installHungNetwork();
+
+  mock.timers.enable({ apis: ["setTimeout"] });
+  try {
+    const pending = dispatchFetch("https://pi.test/", { mode: "navigate" });
+    await flushMicrotasks();
+    mock.timers.tick(8000);
+    const response = await pending;
+
+    assert.equal(wasAborted(), true, "a hung upstream must be aborted, not awaited forever");
+    assert.match(await response.text(), /Pi Web is offline/);
+  } finally {
+    mock.timers.reset();
+  }
+});
+
+test("a stalled static asset request is bounded as well", async () => {
+  installOfflineStub();
+  const wasAborted = installHungNetwork();
+
+  mock.timers.enable({ apis: ["setTimeout"] });
+  try {
+    const pending = dispatchFetch("https://pi.test/_next/static/chunks/app.js");
+    // cacheFirst awaits the cache lookup before it reaches the network.
+    await flushMicrotasks();
+    mock.timers.tick(8000);
+
+    assert.equal(wasAborted(), true);
+    await assert.rejects(pending, /abort/i);
+  } finally {
+    mock.timers.reset();
+  }
+});
+
+test("a response that arrives in time is not cut off mid-stream", async () => {
+  installOfflineStub();
+  let signal;
+  globalThis.fetch = async (_request, init) => {
+    signal = init.signal;
+    return new Response("<!doctype html><title>Pi Web</title>", {
+      status: 200,
+      headers: { "Content-Type": "text/html" },
+    });
+  };
+
+  mock.timers.enable({ apis: ["setTimeout"] });
+  try {
+    const response = await dispatchFetch("https://pi.test/", { mode: "navigate" });
+    // The budget only covers time to first byte: a long-lived body keeps
+    // streaming past it (Next.js streams its SSR payload).
+    mock.timers.tick(60000);
+
+    assert.equal(signal.aborted, false);
+    assert.match(await response.text(), /<title>Pi Web<\/title>/);
+  } finally {
+    mock.timers.reset();
+  }
 });

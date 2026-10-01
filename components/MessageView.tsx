@@ -1,14 +1,19 @@
 "use client";
 
 import { memo, useState, useRef, useEffect, useMemo } from "react";
+import ReactMarkdown from "react-markdown";
 import { MarkdownBody } from "./MarkdownBody";
 import { ImagePreview } from "./ImagePreview";
+import { ThinkingIcon } from "./ThinkingIcon";
 import { copyText } from "@/lib/clipboard";
 import { useI18n } from "@/hooks/useI18n";
 import { parseCompactionSummary } from "@/lib/compaction-summary";
-import { getAssistantErrorMessage, isEmptyThinkingBlock } from "@/lib/message-display";
-import { parseUnifiedPatch, type SplitDiffCell } from "@/lib/patch";
-import { isEditToolName } from "@/lib/tool-names";
+import { getAssistantErrorMessage, getThinkingPreview, hasAssistantAnswer, isAssistantTruncated, isEmptyThinkingBlock } from "@/lib/message-display";
+import { parseUnifiedPatch, type SplitDiffCell, type SplitDiffFile } from "@/lib/patch";
+import { applyPatchPreviewToFiles, applyPatchResultHasFailures, extractApplyPatchPaths, getApplyPatchInputText, parseApplyPatchInput } from "@/lib/apply-patch";
+import { isApplyPatchToolName, isEditToolName } from "@/lib/tool-names";
+import { isToolCallExpanded, setToolCallExpanded } from "@/lib/tool-call-expansion";
+import { isThinkingExpandedByDefault, THINKING_EXPANDED_EVENT } from "@/lib/thinking-expansion-preference";
 import { TurnWrittenFiles } from "./TurnWrittenFiles";
 import type { WrittenFile } from "@/lib/turn-written-files";
 import { skillExpansionToCommand } from "@/lib/slash-display";
@@ -126,7 +131,7 @@ function SafeMarkdownBody({ children, className, ...props }: React.ComponentProp
     );
   }
   return (
-    <div className={className} style={{ maxHeight: 420, overflow: "auto", fontSize: 12, lineHeight: 1.5 }}>
+    <div className={className} style={{ maxHeight: 420, overflow: "auto", fontSize: "calc(12px + var(--chat-font-size-offset, 0px))", lineHeight: 1.5 }}>
       <pre
         style={{
           margin: 0,
@@ -182,14 +187,13 @@ interface Props {
   toolResults?: Map<string, ToolResultMessage>;
   modelNames?: Record<string, string>;
   cwd?: string;
-  onOpenFile?: (filePath: string) => void;
+  onOpenFile?: (filePath: string, page?: number) => void;
   onOpenSession?: (sessionId: string) => void;
   entryId?: string;
+  searchBlock?: AssistantContentBlock;
   onFork?: (entryId: string) => void;
   forking?: boolean;
-  onNavigate?: (entryId: string) => void;
-  prevAssistantEntryId?: string;
-  onEditContent?: (message: UserMessage) => void;
+  onEditContent?: (message: UserMessage, entryId: string) => void;
   showTimestamp?: boolean;
   prevTimestamp?: number;
   sessionId?: string;
@@ -202,6 +206,28 @@ interface Props {
   writtenFiles?: WrittenFile[];
   onReadAloud?: (text: string) => void;
   readingText?: string | null;
+  onCompact?: () => void;
+  isCompacting?: boolean;
+  compactError?: string | null;
+}
+
+export function getModelDisplayName(
+  provider: string,
+  responseModel: string,
+  modelNames?: Record<string, string>,
+): string {
+  const normalizedProvider = provider.toLowerCase();
+  const normalizedResponse = responseModel.toLowerCase();
+  const configured = Object.entries(modelNames ?? {}).flatMap(([key, name]) => {
+    const separator = key.indexOf(":");
+    return separator > 0 && key.slice(0, separator).toLowerCase() === normalizedProvider
+      ? [{ id: key.slice(separator + 1).toLowerCase(), name }]
+      : [];
+  });
+  return configured.find((model) => model.id === normalizedResponse)?.name
+    ?? configured.find((model) => normalizedResponse.endsWith(`/${model.id}`))?.name
+    ?? Object.entries(modelNames ?? {}).find(([key]) => key.toLowerCase() === normalizedResponse)?.[1]
+    ?? `${provider}/${responseModel}`;
 }
 
 function formatTime(ts?: number): string | null {
@@ -250,12 +276,12 @@ function haveSameRelevantToolResults(
   return true;
 }
 
-export const MessageView = memo(function MessageView({ message, isStreaming, toolResults, modelNames, cwd, onOpenFile, onOpenSession, entryId, onFork, forking, onNavigate, prevAssistantEntryId, onEditContent, showTimestamp, prevTimestamp, sessionId, writtenFiles, onReadAloud, readingText }: Props) {
+export const MessageView = memo(function MessageView({ message, isStreaming, toolResults, modelNames, cwd, onOpenFile, onOpenSession, entryId, searchBlock, onFork, forking, onEditContent, showTimestamp, prevTimestamp, sessionId, writtenFiles, onCompact, isCompacting, compactError, onReadAloud, readingText }: Props) {
   if (message.role === "user") {
-    return <UserMessageView message={message as UserMessage} cwd={cwd} onOpenFile={onOpenFile} entryId={entryId} onFork={onFork} forking={forking} onNavigate={onNavigate} prevAssistantEntryId={prevAssistantEntryId} onEditContent={onEditContent} />;
+    return <UserMessageView message={message as UserMessage} cwd={cwd} onOpenFile={onOpenFile} entryId={entryId} onFork={onFork} forking={forking} onEditContent={onEditContent} />;
   }
   if (message.role === "assistant") {
-    return <AssistantMessageView message={message as AssistantMessage} isStreaming={isStreaming} toolResults={toolResults} modelNames={modelNames} cwd={cwd} onOpenFile={onOpenFile} onOpenSession={onOpenSession} showTimestamp={showTimestamp} prevTimestamp={prevTimestamp} sessionId={sessionId} entryId={entryId} writtenFiles={writtenFiles} onReadAloud={onReadAloud} readingText={readingText} />;
+    return <AssistantMessageView message={message as AssistantMessage} isStreaming={isStreaming} toolResults={toolResults} modelNames={modelNames} cwd={cwd} onOpenFile={onOpenFile} onOpenSession={onOpenSession} showTimestamp={showTimestamp} prevTimestamp={prevTimestamp} sessionId={sessionId} entryId={entryId} searchBlock={searchBlock} writtenFiles={writtenFiles} onCompact={onCompact} isCompacting={isCompacting} compactError={compactError} onReadAloud={onReadAloud} readingText={readingText} />;
   }
   if (message.role === "toolResult") {
     // Rendered inline under its toolCall — skip standalone rendering if paired
@@ -280,41 +306,46 @@ export const MessageView = memo(function MessageView({ message, isStreaming, too
     && prev.onOpenFile === next.onOpenFile
     && prev.onOpenSession === next.onOpenSession
     && prev.entryId === next.entryId
+    && prev.searchBlock === next.searchBlock
     && prev.onFork === next.onFork
     && prev.forking === next.forking
-    && prev.onNavigate === next.onNavigate
-    && prev.prevAssistantEntryId === next.prevAssistantEntryId
     && prev.onEditContent === next.onEditContent
     && prev.showTimestamp === next.showTimestamp
     && prev.prevTimestamp === next.prevTimestamp
+    && prev.writtenFiles === next.writtenFiles
     && prev.sessionId === next.sessionId
+    && prev.onCompact === next.onCompact
+    && prev.isCompacting === next.isCompacting
+    && prev.compactError === next.compactError
     && prev.onReadAloud === next.onReadAloud
     && prev.readingText === next.readingText;
 });
 
-function UserMessageView({ message, cwd, onOpenFile, entryId, onFork, forking, onNavigate, prevAssistantEntryId, onEditContent }: {
+function UserMessageView({ message, cwd, onOpenFile, entryId, onFork, forking, onEditContent }: {
   message: UserMessage;
   cwd?: string;
-  onOpenFile?: (filePath: string) => void;
+  onOpenFile?: (filePath: string, page?: number) => void;
   entryId?: string;
   onFork?: (entryId: string) => void;
   forking?: boolean;
-  onNavigate?: (entryId: string) => void;
-  prevAssistantEntryId?: string;
-  onEditContent?: (message: UserMessage) => void;
+  onEditContent?: (message: UserMessage, entryId: string) => void;
 }) {
   const { t } = useI18n();
   const [hovered, setHovered] = useState(false);
   const [copied, setCopied] = useState(false);
   const [expanded, setExpanded] = useState(false);
 
-  const content =
+  // Session files can hold `\r\n` or lone `\r` line endings (#680). Chrome renders
+  // a lone `\r` as a space even in the pre-wrap command-args and raw-text views.
+  // Copy uses this text too; the session file keeps the original endings.
+  const content = (
     typeof message.content === "string"
       ? message.content
       : message.content
           .filter((b): b is TextContent => b.type === "text")
           .map((b) => b.text)
-          .join("\n");
+          .join("\n")
+  ).replace(/\r\n?/g, "\n");
 
   const imageBlocks: ImageContent[] =
     typeof message.content === "string"
@@ -361,7 +392,7 @@ function UserMessageView({ message, cwd, onOpenFile, entryId, onFork, forking, o
       })}
     </div>
   );
-  const canNavigate = !!prevAssistantEntryId && !!onNavigate;
+  const canEdit = !!entryId && !!onEditContent;
 
   const copyContent = () => {
     copyText(copyTarget).then(() => {
@@ -385,7 +416,7 @@ function UserMessageView({ message, cwd, onOpenFile, entryId, onFork, forking, o
             border: "1px solid rgba(59,130,246,0.2)",
             borderRadius: 12,
             padding: "8px 12px",
-            fontSize: 14,
+            fontSize: "calc(14px + var(--chat-font-size-offset, 0px))",
             lineHeight: 1.6,
             color: "var(--text)",
             wordBreak: "break-word",
@@ -412,7 +443,7 @@ function UserMessageView({ message, cwd, onOpenFile, entryId, onFork, forking, o
                     cursor: "pointer",
                     color: "var(--accent)",
                     fontFamily: "var(--font-mono)",
-                    fontSize: 13,
+                    fontSize: "calc(13px + var(--chat-font-size-offset, 0px))",
                     textAlign: "left",
                   }}
                 >
@@ -437,7 +468,7 @@ function UserMessageView({ message, cwd, onOpenFile, entryId, onFork, forking, o
                 {commandArgs && (
                   <span style={{
                     color: "var(--text)",
-                    fontSize: 14,
+                    fontSize: "calc(14px + var(--chat-font-size-offset, 0px))",
                     lineHeight: 1.6,
                     whiteSpace: "pre-wrap",
                     wordBreak: "break-word",
@@ -449,13 +480,13 @@ function UserMessageView({ message, cwd, onOpenFile, entryId, onFork, forking, o
                 )}
               </div>
               {expanded && (
-                <MarkdownBody className="markdown-user-message" cwd={cwd} onOpenFile={onOpenFile}>{content}</MarkdownBody>
+                <MarkdownBody className="markdown-user-message" keepLineBreaks cwd={cwd} onOpenFile={onOpenFile}>{content}</MarkdownBody>
               )}
             </div>
           ) : (
           <>
           {imageBlocksNode}
-          {content && <SafeMarkdownBody className="markdown-user-message" cwd={cwd} onOpenFile={onOpenFile}>{content}</SafeMarkdownBody>}
+          {content && <SafeMarkdownBody className="markdown-user-message" keepLineBreaks cwd={cwd} onOpenFile={onOpenFile}>{content}</SafeMarkdownBody>}
           </>
           )}
         </div>
@@ -463,7 +494,7 @@ function UserMessageView({ message, cwd, onOpenFile, entryId, onFork, forking, o
       </div>
 
       {/* Bottom row: action buttons + timestamp */}
-      {(time || canFork || canNavigate || true) && (
+      {(time || canFork || canEdit || true) && (
         <div style={{
           display: "flex", alignItems: "center", justifyContent: "flex-end",
           gap: 6, marginTop: 3,
@@ -504,16 +535,16 @@ function UserMessageView({ message, cwd, onOpenFile, entryId, onFork, forking, o
                {copied ? t("i18n.copied") : t("i18n.copy")}
             </button>
           </div>
-          {(canFork || canNavigate) && (
+          {(canFork || canEdit) && (
             <div style={{
               display: "flex", gap: 3,
               opacity: (hovered || forking) ? 1 : 0,
               pointerEvents: (hovered || forking) ? "auto" : "none",
               transition: "opacity 0.12s",
             }}>
-              {canNavigate && (
+              {canEdit && (
                 <button
-                  onClick={() => { onNavigate!(prevAssistantEntryId!); onEditContent?.(editTarget); }}
+                  onClick={() => onEditContent!(editTarget, entryId!)}
                    title={t("i18n.editFromHereTitle")}
                   style={{
                     display: "flex", alignItems: "center", gap: 4,
@@ -585,24 +616,32 @@ function AssistantMessageView({
   prevTimestamp,
   sessionId,
   entryId,
+  searchBlock,
   writtenFiles,
   onReadAloud,
   readingText,
+  onCompact,
+  isCompacting,
+  compactError,
 }: {
   message: AssistantMessage;
   isStreaming?: boolean;
   toolResults?: Map<string, ToolResultMessage>;
   modelNames?: Record<string, string>;
   cwd?: string;
-  onOpenFile?: (filePath: string) => void;
+  onOpenFile?: (filePath: string, page?: number) => void;
   onOpenSession?: (sessionId: string) => void;
   showTimestamp?: boolean;
   prevTimestamp?: number;
   sessionId?: string;
   entryId?: string;
+  searchBlock?: AssistantContentBlock;
   writtenFiles?: WrittenFile[];
   onReadAloud?: (text: string) => void;
   readingText?: string | null;
+  onCompact?: () => void;
+  isCompacting?: boolean;
+  compactError?: string | null;
 }) {
   const { t } = useI18n();
   const time = showTimestamp ? formatTime(message.timestamp) : null;
@@ -611,6 +650,8 @@ function AssistantMessageView({
     .filter(({ block }) => !isEmptyThinkingBlock(block, { isStreaming })), [message.content, isStreaming]);
   const blocks = useMemo(() => blockItems.map(({ block }) => block), [blockItems]);
   const providerError = getAssistantErrorMessage(message, { isStreaming });
+  const truncated = isAssistantTruncated(message, { isStreaming });
+  const unansweredTruncation = truncated && !hasAssistantAnswer(message);
   const [hovered, setHovered] = useState(false);
   const [copied, setCopied] = useState(false);
   const streamStartRef = useRef<number | null>(null);
@@ -730,10 +771,12 @@ function AssistantMessageView({
     return () => clearInterval(id);
   }, [isStreaming]);
 
-  if (blocks.length === 0 && !isStreaming && !providerError) return null;
+  if (blocks.length === 0 && !isStreaming && !providerError && !truncated) return null;
 
   return (
     <div
+      data-message-role="assistant"
+      data-entry-id={entryId}
       style={{ marginBottom: 16 }}
       onMouseEnter={() => setHovered(true)}
       onMouseLeave={() => setHovered(false)}
@@ -750,7 +793,7 @@ function AssistantMessageView({
         }}
       >
         {message.provider && (
-          <span>{modelNames?.[`${message.provider}:${message.model}`] ?? modelNames?.[message.model] ?? message.model}</span>
+          <span>{getModelDisplayName(message.provider, message.model, modelNames)}</span>
         )}
         {isStreaming && (() => {
           const est = Math.round(estimatedTokens);
@@ -782,7 +825,7 @@ function AssistantMessageView({
 
       <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
         {blockItems.map(({ block, originalIndex }) => (
-          <BlockView key={`${entryId ?? "stream"}-${originalIndex}`} block={block} toolResults={toolResults} isStreaming={isStreaming} streamingDuration={streamingDurations.get(originalIndex) ?? (block.type === "thinking" ? thinkingDurationFromFile : undefined)} toolCallDurations={toolCallDurations} cwd={cwd} onOpenFile={onOpenFile} onOpenSession={onOpenSession} sessionId={sessionId} entryId={entryId} blockIndex={originalIndex} />
+          <BlockView key={`${entryId ?? "stream"}-${originalIndex}`} block={block} searchTarget={block === searchBlock} toolResults={toolResults} isStreaming={isStreaming} streamingDuration={streamingDurations.get(originalIndex) ?? (block.type === "thinking" ? thinkingDurationFromFile : undefined)} toolCallDurations={toolCallDurations} cwd={cwd} onOpenFile={onOpenFile} onOpenSession={onOpenSession} sessionId={sessionId} entryId={entryId} blockIndex={originalIndex} />
         ))}
       </div>
 
@@ -804,6 +847,50 @@ function AssistantMessageView({
           }}
         >
           Error: {providerError}
+        </div>
+      )}
+
+      {truncated && (
+        <div
+          role="alert"
+          style={{
+            marginTop: blocks.length > 0 || providerError ? 8 : 0,
+            padding: "7px 10px",
+            border: "1px solid rgba(234,179,8,0.3)",
+            borderRadius: 6,
+            background: "rgba(234,179,8,0.07)",
+            color: "#ca8a04",
+            fontFamily: "var(--font-mono)",
+            fontSize: 12,
+            lineHeight: 1.5,
+            whiteSpace: "pre-wrap",
+            overflowWrap: "anywhere",
+          }}
+        >
+          {t(unansweredTruncation ? "chat.truncatedWithoutAnswer" : "chat.truncatedByOutputLimit")}
+          {unansweredTruncation && onCompact && (
+            <button
+              type="button"
+              onClick={onCompact}
+              disabled={isCompacting}
+              style={{
+                display: "block",
+                marginTop: 8,
+                padding: "3px 8px",
+                border: "1px solid currentColor",
+                borderRadius: 5,
+                background: "transparent",
+                color: "inherit",
+                cursor: isCompacting ? "default" : "pointer",
+                font: "inherit",
+              }}
+            >
+              {t(isCompacting ? "chat.compacting" : "chat.compactContext")}
+            </button>
+          )}
+          {unansweredTruncation && compactError && (
+            <div style={{ marginTop: 8, color: "#ef4444", whiteSpace: "pre-wrap" }}>{compactError}</div>
+          )}
         </div>
       )}
 
@@ -888,9 +975,9 @@ function AssistantMessageView({
   );
 }
 
-function BlockView({ block, toolResults, isStreaming, streamingDuration, toolCallDurations, cwd, onOpenFile, onOpenSession, sessionId, entryId, blockIndex }: { block: AssistantContentBlock; toolResults?: Map<string, ToolResultMessage>; isStreaming?: boolean; streamingDuration?: number; toolCallDurations?: Map<string, number>; cwd?: string; onOpenFile?: (filePath: string) => void; onOpenSession?: (sessionId: string) => void; sessionId?: string; entryId?: string; blockIndex: number }) {
+function BlockView({ block, searchTarget, toolResults, isStreaming, streamingDuration, toolCallDurations, cwd, onOpenFile, onOpenSession, sessionId, entryId, blockIndex }: { block: AssistantContentBlock; searchTarget?: boolean; toolResults?: Map<string, ToolResultMessage>; isStreaming?: boolean; streamingDuration?: number; toolCallDurations?: Map<string, number>; cwd?: string; onOpenFile?: (filePath: string, page?: number) => void; onOpenSession?: (sessionId: string) => void; sessionId?: string; entryId?: string; blockIndex: number }) {
   if (block.type === "text") {
-    return <TextBlock block={block as TextContent} isStreaming={isStreaming} cwd={cwd} onOpenFile={onOpenFile} />;
+    return <div data-message-text data-search-target={searchTarget || undefined}><TextBlock block={block as TextContent} isStreaming={isStreaming} cwd={cwd} onOpenFile={onOpenFile} /></div>;
   }
   if (block.type === "thinking") {
     return <ThinkingBlock block={block as ThinkingContent} duration={streamingDuration} sessionId={sessionId} entryId={entryId} blockIndex={blockIndex} />;
@@ -904,11 +991,11 @@ function BlockView({ block, toolResults, isStreaming, streamingDuration, toolCal
   return null;
 }
 
-function TextBlock({ block, isStreaming, cwd, onOpenFile }: { block: TextContent; isStreaming?: boolean; cwd?: string; onOpenFile?: (filePath: string) => void }) {
+function TextBlock({ block, isStreaming, cwd, onOpenFile }: { block: TextContent; isStreaming?: boolean; cwd?: string; onOpenFile?: (filePath: string, page?: number) => void }) {
   return <SafeMarkdownBody isStreaming={isStreaming} cwd={cwd} onOpenFile={onOpenFile}>{block.text}</SafeMarkdownBody>;
 }
 
-function ThinkingBlock({ block, duration, sessionId, entryId, blockIndex }: {
+export function ThinkingBlock({ block, duration, sessionId, entryId, blockIndex }: {
   block: ThinkingContent;
   duration?: number;
   sessionId?: string;
@@ -916,75 +1003,108 @@ function ThinkingBlock({ block, duration, sessionId, entryId, blockIndex }: {
   blockIndex: number;
 }) {
   const { t } = useI18n();
-  const [expanded, setExpanded] = useState(false);
+  const [expanded, setExpanded] = useState(isThinkingExpandedByDefault);
   const [content, setContent] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const tRef = useRef(t);
+  tRef.current = t;
+  const preview = getThinkingPreview(block.thinking);
 
-  const toggle = async () => {
-    const nextExpanded = !expanded;
-    setExpanded(nextExpanded);
-    if (!nextExpanded || !block.deferred || content !== null) return;
+  // Keep already-mounted blocks in sync when the preference changes.
+  useEffect(() => {
+    const onChange = () => setExpanded(isThinkingExpandedByDefault());
+    window.addEventListener(THINKING_EXPANDED_EVENT, onChange);
+    return () => window.removeEventListener(THINKING_EXPANDED_EVENT, onChange);
+  }, []);
+
+  // Load deferred history content whenever the block is expanded.
+  // loadThinkingContent() memoizes in-flight promises and drops failed ones
+  // from its cache, so re-running this effect is cheap and a failed load can
+  // be retried by collapsing and expanding the block again.
+  useEffect(() => {
+    if (!expanded || !block.deferred || content !== null) return;
     if (!sessionId || !entryId) {
-      setError(t("i18n.thinkingUnavailable"));
+      setError(tRef.current("i18n.thinkingUnavailable"));
       return;
     }
-
+    let cancelled = false;
     setLoading(true);
     setError(null);
-    try {
-      setContent(await loadThinkingContent(sessionId, entryId, blockIndex));
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setLoading(false);
-    }
-  };
+    loadThinkingContent(sessionId, entryId, blockIndex)
+      .then((value) => {
+        if (!cancelled) {
+          setContent(value);
+          setLoading(false);
+        }
+      })
+      .catch((err) => {
+        if (!cancelled) {
+          setError(err instanceof Error ? err.message : String(err));
+          setLoading(false);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [expanded, block.deferred, content, sessionId, entryId, blockIndex]);
 
   return (
-    <div
-      style={{
-        border: "1px solid var(--border)",
-        borderRadius: 6,
-        overflow: "hidden",
-        fontSize: 13,
-      }}
-    >
+    <div style={{
+      display: "flex", alignItems: "flex-start", gap: 6, minWidth: 0,
+      border: "1px solid var(--border)",
+      borderRadius: 7,
+      padding: "6px 10px",
+      background: "var(--bg)",
+      fontFamily: "var(--font-mono)",
+      fontSize: "calc(11px + var(--chat-font-size-offset, 0px))",
+      lineHeight: 1.5,
+    }}>
       <button
-        onClick={() => void toggle()}
+        type="button"
+        aria-expanded={expanded}
+        aria-label={`${t("i18n.thinking")}${preview ? `: ${preview}` : ""}`}
+        title={t("i18n.thinking")}
+        onClick={() => setExpanded((v) => !v)}
         style={{
-          display: "flex",
+          display: "inline-flex",
           alignItems: "center",
           gap: 6,
-          width: "100%",
-          padding: "6px 10px",
-          background: "var(--bg-panel)",
+          width: expanded ? 14 : "100%",
+          flexShrink: expanded ? 0 : 1,
+          minWidth: 0,
+          minHeight: "1.5em",
+          padding: 0,
+          background: "transparent",
           border: "none",
           color: "var(--text-muted)",
           cursor: "pointer",
-          fontSize: 12,
+          font: "inherit",
           textAlign: "left",
         }}
       >
-         <span>{t("i18n.thinking")}</span>
-        {duration !== undefined && (
-          <span style={{ marginLeft: "auto", fontSize: 11, color: "var(--text-dim)", fontVariantNumeric: "tabular-nums" }}>{duration}s</span>
+        <ThinkingIcon active={expanded} />
+        {!expanded && (
+          <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+            {preview ? <ReactMarkdown allowedElements={[]} unwrapDisallowed skipHtml>{preview}</ReactMarkdown> : "..."}
+          </span>
         )}
       </button>
       {expanded && (
         <div
           style={{
-            padding: "8px 10px",
+            flex: 1,
+            minWidth: 0,
             color: error ? "#f87171" : "var(--text-muted)",
-            fontSize: 12,
-            lineHeight: 1.6,
             whiteSpace: "pre-wrap",
-            background: "var(--bg-panel)",
-            borderTop: "1px solid var(--border)",
+            overflowWrap: "anywhere",
           }}
         >
            {loading ? t("i18n.loadingThinking") : error ?? (block.deferred ? content : block.thinking)}
         </div>
+      )}
+      {duration !== undefined && (
+        <span style={{ flexShrink: 0, color: "var(--text-dim)", fontVariantNumeric: "tabular-nums" }}>{duration}s</span>
       )}
     </div>
   );
@@ -998,11 +1118,20 @@ function isSubagentToolDetails(value: unknown): value is SubagentToolDetails {
 
 function ToolCallBlock({ block, result, duration, onOpenSession }: { block: ToolCallContent; result?: ToolResultMessage; duration?: number; onOpenSession?: (sessionId: string) => void }) {
   const { t } = useI18n();
-  const [expanded, setExpanded] = useState(false);
+  const [expanded, setExpanded] = useState(() => isToolCallExpanded(block.toolCallId));
+  const toggleExpanded = () => {
+    const next = !expanded;
+    setToolCallExpanded(block.toolCallId, next);
+    setExpanded(next);
+  };
   const inputStr = getToolCallInputText(block);
   const isStreamingInput = block.rawInput !== undefined;
   const isEditTool = isEditToolName(block.toolName);
   const resultDiff = result && !result.isError ? getResultDiff(result) : null;
+  const patchFiles = getApplyPatchFiles(block, result);
+  const patchLabel = isApplyPatchToolName(block.toolName)
+    ? summarizeApplyPatchInput(block)
+    : null;
 
   // Result display
   const resultText = result
@@ -1010,7 +1139,8 @@ function ToolCallBlock({ block, result, duration, onOpenSession }: { block: Tool
     : null;
   const resultImages = getMessageImages(result?.content ?? []);
   const resultIsEmpty = resultText === null ? false : (resultText.trim() === "(no output)" || resultText.trim() === "");
-  const isError = result?.isError ?? false;
+  const isError = (result?.isError ?? false)
+    || (isApplyPatchToolName(block.toolName) && applyPatchResultHasFailures(result?.details));
   const subagent = isSubagentToolDetails(result?.details) ? result.details : null;
 
   return (
@@ -1026,7 +1156,7 @@ function ToolCallBlock({ block, result, duration, onOpenSession }: { block: Tool
       {/* ── Tool call header ── */}
       <div style={{ display: "flex", alignItems: "stretch", minWidth: 0 }}>
         <button
-          onClick={() => setExpanded((v) => !v)}
+          onClick={toggleExpanded}
           style={{
             display: "flex",
             alignItems: "center",
@@ -1046,7 +1176,7 @@ function ToolCallBlock({ block, result, duration, onOpenSession }: { block: Tool
             {block.toolName}
           </span>
           <span style={{ color: "var(--text-dim)", fontFamily: "var(--font-mono)", fontSize: 11, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: 1, minWidth: 0 }}>
-            {isStreamingInput ? t("chat.generatingToolInput") : getToolPreview(block)}
+            {isStreamingInput ? t("chat.generatingToolInput") : (patchLabel ?? getToolPreview(block))}
           </span>
           {duration !== undefined && (
             <span style={{ fontSize: 11, color: "var(--text-dim)", flexShrink: 0, fontVariantNumeric: "tabular-nums" }}>{duration}s</span>
@@ -1068,14 +1198,14 @@ function ToolCallBlock({ block, result, duration, onOpenSession }: { block: Tool
         )}
       </div>
 
-      {/* ── Expanded: input args ── */}
-      {expanded && (isStreamingInput || !isEditTool) && (
+      {/* ── Expanded: input args (only when no richer view exists) ── */}
+      {expanded && (isStreamingInput || !isEditTool) && !patchFiles && (
         <pre
           style={{
             margin: 0,
             padding: "8px 10px",
             color: "var(--text-muted)",
-            fontSize: 12,
+            fontSize: "calc(12px + var(--chat-font-size-offset, 0px))",
             lineHeight: 1.5,
             overflow: "auto",
             background: "var(--bg-subtle)",
@@ -1088,16 +1218,32 @@ function ToolCallBlock({ block, result, duration, onOpenSession }: { block: Tool
         </pre>
       )}
 
+      {/* ── Result images — always visible, independent of the collapsed details ── */}
+      {resultImages.length > 0 && <ResultImages images={resultImages} isError={isError} />}
+
+      {/* ── Expanded: applied-patch split diff ── */}
+      {expanded && patchFiles && (
+        <div style={{ borderTop: "1px solid rgba(34,197,94,0.15)", background: "var(--bg)" }}>
+          <SplitFilesView files={patchFiles} />
+        </div>
+      )}
+
       {/* ── Paired result — only shown when expanded ── */}
-      {expanded && result && (
+      {expanded && result && patchFiles && isError && (
+        <PairedResult
+          text={resultText ?? ""}
+          isEmpty={resultIsEmpty}
+          isError={isError}
+        />
+      )}
+      {expanded && result && !patchFiles && (
         resultDiff ? (
           <PairedDiffResult
             diff={resultDiff}
           />
-        ) : (
+        ) : (!resultIsEmpty || resultImages.length === 0) && (
           <PairedResult
             text={resultText ?? ""}
-            images={resultImages}
             isEmpty={resultIsEmpty}
             isError={isError}
           />
@@ -1127,9 +1273,13 @@ function PairedDiffResult({ diff }: {
 }
 
 function SplitPatchView({ text }: { text: string }) {
-  const { t } = useI18n();
   const files = useMemo(() => parseUnifiedPatch(text), [text]);
   if (!files) return <PatchTextView text={text} />;
+  return <SplitFilesView files={files} />;
+}
+
+function SplitFilesView({ files }: { files: SplitDiffFile[] }) {
+  const { t } = useI18n();
   const showFileHeaders = files.length > 1;
 
   return (
@@ -1141,7 +1291,7 @@ function SplitPatchView({ text }: { text: string }) {
             minWidth: 0,
             borderTop: fileIndex === 0 ? "none" : "1px solid var(--border)",
             fontFamily: "var(--font-mono)",
-            fontSize: 12,
+            fontSize: "calc(12px + var(--chat-font-size-offset, 0px))",
             lineHeight: 1.55,
           }}
         >
@@ -1269,7 +1419,7 @@ function PatchTextView({ text }: { text: string }) {
   const lines = text.split(/\r?\n/);
 
   return (
-    <div style={{ maxHeight: 520, overflowY: "auto", overflowX: "hidden", fontFamily: "var(--font-mono)", fontSize: 12, lineHeight: 1.55, minWidth: 0 }}>
+    <div style={{ maxHeight: 520, overflowY: "auto", overflowX: "hidden", fontFamily: "var(--font-mono)", fontSize: "calc(12px + var(--chat-font-size-offset, 0px))", lineHeight: 1.55, minWidth: 0 }}>
       {lines.map((line, i) => {
         const kind =
           line.startsWith("@@") ? "hunk" :
@@ -1326,6 +1476,37 @@ function PatchTextView({ text }: { text: string }) {
   );
 }
 
+/**
+ * Split diff rows for an apply_patch-style tool call.
+ *
+ * Prefers parsing the V4A patch document from the call input. The extension's
+ * applied result preview contains the complete old/new file with unchanged
+ * lines, so it is only used as a fallback when the call input is unavailable.
+ * A single call may contain several file operations — each becomes its own
+ * file section.
+ */
+function getApplyPatchFiles(block: ToolCallContent, result?: ToolResultMessage): SplitDiffFile[] | null {
+  if (!isApplyPatchToolName(block.toolName)) return null;
+
+  const fromInput = parseApplyPatchInput(getApplyPatchInputText(block.input, block.rawInput));
+  if (fromInput) return fromInput;
+
+  const details = result && !result.isError ? (result as ToolResultMessage & { details?: unknown }).details : undefined;
+  if (isRecord(details)) {
+    const fromPreview = applyPatchPreviewToFiles(details.preview);
+    if (fromPreview) return fromPreview;
+  }
+
+  return null;
+}
+
+/** Header label listing the files targeted by an apply_patch call. */
+function summarizeApplyPatchInput(block: ToolCallContent): string | null {
+  const paths = extractApplyPatchPaths(getApplyPatchInputText(block.input, block.rawInput));
+  if (paths.length === 0) return null;
+  return paths.join(", ").slice(0, 120);
+}
+
 function getResultDiff(result: ToolResultMessage): ResultDiff | null {
   const details = (result as ToolResultMessage & { details?: unknown }).details;
   if (!isRecord(details)) return null;
@@ -1343,14 +1524,54 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function PairedResult({ text, images, isEmpty, isError }: {
+function ResultImages({ images, isError }: { images: ImageContent[]; isError: boolean }) {
+  return (
+    <div
+      style={{
+        display: "flex",
+        gap: 8,
+        flexWrap: "wrap",
+        padding: "10px",
+        background: "var(--bg)",
+        borderTop: `1px solid ${isError ? "rgba(248,113,113,0.3)" : "rgba(34,197,94,0.15)"}`,
+      }}
+    >
+      {images.map((image, index) => {
+        const src = imageSource(image);
+        if (!src) return null;
+        return (
+          <ImagePreview
+            key={`${src}-${index}`}
+            src={src}
+            style={{ maxWidth: "100%" }}
+          >
+            {/* eslint-disable-next-line @next/next/no-img-element */}
+            <img
+              src={src}
+              alt=""
+              loading="lazy"
+              style={{
+                display: "block",
+                maxWidth: "min(100%, 720px)",
+                maxHeight: 520,
+                borderRadius: 6,
+                objectFit: "contain",
+                border: "1px solid var(--border)",
+              }}
+            />
+          </ImagePreview>
+        );
+      })}
+    </div>
+  );
+}
+
+function PairedResult({ text, isEmpty, isError }: {
   text: string;
-  images: ImageContent[];
   isEmpty: boolean;
   isError: boolean;
 }) {
   const { t } = useI18n();
-  const showText = !isEmpty || images.length === 0;
   return (
     <div
       style={{
@@ -1358,56 +1579,24 @@ function PairedResult({ text, images, isEmpty, isError }: {
         background: isError ? "rgba(248,113,113,0.04)" : "var(--bg-subtle)",
       }}
     >
-      {images.length > 0 && (
-        <div style={{ display: "flex", gap: 8, flexWrap: "wrap", padding: "10px", background: "var(--bg)" }}>
-          {images.map((image, index) => {
-            const src = imageSource(image);
-            if (!src) return null;
-            return (
-              <ImagePreview
-                key={`${src}-${index}`}
-                src={src}
-                style={{ maxWidth: "100%" }}
-              >
-                {/* eslint-disable-next-line @next/next/no-img-element */}
-                <img
-                  src={src}
-                  alt=""
-                  loading="lazy"
-                  style={{
-                    display: "block",
-                    maxWidth: "min(100%, 720px)",
-                    maxHeight: 520,
-                    borderRadius: 6,
-                    objectFit: "contain",
-                    border: "1px solid var(--border)",
-                  }}
-                />
-              </ImagePreview>
-            );
-          })}
-        </div>
-      )}
-      {showText && (
-        <pre
-          style={{
-            margin: 0,
-            padding: "8px 10px",
-            color: isError ? "#f87171" : (isEmpty ? "var(--text-dim)" : "var(--text-muted)"),
-            fontSize: 12,
-            lineHeight: 1.5,
-            overflow: "auto",
-            maxHeight: 400,
-            background: "var(--bg)",
-            whiteSpace: "pre-wrap",
-            wordBreak: "break-all",
-            fontStyle: isEmpty ? "italic" : "normal",
-            opacity: isEmpty ? 0.6 : 1,
-          }}
-        >
-           {isEmpty ? t("i18n.noOutput") : text}
-        </pre>
-      )}
+      <pre
+        style={{
+          margin: 0,
+          padding: "8px 10px",
+          color: isError ? "#f87171" : (isEmpty ? "var(--text-dim)" : "var(--text-muted)"),
+          fontSize: "calc(12px + var(--chat-font-size-offset, 0px))",
+          lineHeight: 1.5,
+          overflow: "auto",
+          maxHeight: 400,
+          background: "var(--bg)",
+          whiteSpace: "pre-wrap",
+          wordBreak: "break-all",
+          fontStyle: isEmpty ? "italic" : "normal",
+          opacity: isEmpty ? 0.6 : 1,
+        }}
+      >
+        {isEmpty ? t("i18n.noOutput") : text}
+      </pre>
     </div>
   );
 }
@@ -1446,10 +1635,10 @@ function CompactionMessageView({ message }: { message: CustomMessage }) {
         </div>
 
         <div style={{ padding: "11px 13px 12px" }}>
-          <div style={{ color: "var(--text)", fontSize: 15, fontWeight: 700, lineHeight: 1.35 }}>
+          <div style={{ color: "var(--text)", fontSize: "calc(15px + var(--chat-font-size-offset, 0px))", fontWeight: 700, lineHeight: 1.35 }}>
              {t("i18n.conversationCompacted")}
           </div>
-          <div style={{ marginTop: 3, marginBottom: 10, color: "var(--text)", fontSize: 14, lineHeight: 1.5 }}>
+          <div style={{ marginTop: 3, marginBottom: 10, color: "var(--text)", fontSize: "calc(14px + var(--chat-font-size-offset, 0px))", lineHeight: 1.5 }}>
              {t("i18n.compactionDescription")}
           </div>
           {parsedSummary.body ? (
@@ -1495,7 +1684,7 @@ function CompactionFileList({ title, files }: { title: string; files: string[] }
   );
 }
 
-function CustomMessageView({ message, cwd, onOpenFile }: { message: CustomMessage; cwd?: string; onOpenFile?: (filePath: string) => void }) {
+function CustomMessageView({ message, cwd, onOpenFile }: { message: CustomMessage; cwd?: string; onOpenFile?: (filePath: string, page?: number) => void }) {
   const { t } = useI18n();
   const isHiddenDisplay = message.display === false;
   const [contentExpanded, setContentExpanded] = useState(!isHiddenDisplay);
@@ -1642,7 +1831,7 @@ function CustomMessageView({ message, cwd, onOpenFile }: { message: CustomMessag
               borderTop: "1px solid var(--border)",
               background: "var(--bg)",
               color: "var(--text-muted)",
-              fontSize: 12,
+              fontSize: "calc(12px + var(--chat-font-size-offset, 0px))",
               lineHeight: 1.5,
               whiteSpace: "pre-wrap",
               wordBreak: "break-word",
